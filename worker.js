@@ -14,6 +14,8 @@ const GITHUB_URL = "https://github.com/mangoALCATRAZ/house-bot";
 
 const PEOPLE = {
   "snake": "<@436947323445313536>",
+  "floogin": "<@209825795852599297>",
+  "toad": "<@424005925859229696>",
 };
 
 function botHeaders(env) {
@@ -491,6 +493,8 @@ async function maybePostDocs(env) {
       "",
       "## 👤 Supported People",
       "- `snake` — <@436947323445313536>",
+      "- `floogin` — <@209825795852599297>",
+      "- `toad` — <@424005925859229696>",
       "",
       "---",
       "",
