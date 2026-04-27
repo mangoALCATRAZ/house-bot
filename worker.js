@@ -30,7 +30,9 @@ function botHeaders(env) {
 
 async function sendMessage(env, channelId, content) {
   const targetChannel = DEV_MODE ? DEV_CHANNEL_ID : channelId;
-  const finalContent = DEV_MODE ? `[→ <#${channelId}>] ${content}` : content;
+  let finalContent = DEV_MODE
+    ? `[→ <#${channelId}>] ${content.replace(/@everyone/g, "").replace(/@here/g, "").trim()}`
+    : content;
   const res = await fetch(`${API}/channels/${targetChannel}/messages`, {
     method: "POST",
     headers: botHeaders(env),
