@@ -1,0 +1,15 @@
+name = "discord-shortcut"
+main = "worker.js"
+compatibility_date = "2025-04-26"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "1bcf1ec125d44c1a88f45f0a89595374"
+
+[[durable_objects.bindings]]
+name = "TIMER"
+class_name = "TimerDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TimerDO"]
