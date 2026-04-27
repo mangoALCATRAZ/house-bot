@@ -367,7 +367,7 @@ async function maybePostLaundryIntro(env) {
       "​",
       "**Status guide:**",
       "🫧 **Washer Running** — The washer is currently running.",
-      "👕 **Washer Done** — The washer is done! Move it to the dryer.",
+      "⚠️ **Washer Done** — The washer is done! Move it to the dryer.",
       "🌀 **Dryer Running** — The dryer is currently running.",
       "✅ **Dryer Done** — The dryer is done! Ready to fold.",
       "​",
@@ -424,15 +424,10 @@ async function maybePostDocs(env) {
       "",
       "**`GET /`** — Start a dishwasher cycle",
       "- `minutes` — Estimated runtime *(optional, default: 150)*",
-      "```",
-      "GET /?token=TOKEN",
-      "GET /?token=TOKEN&minutes=90",
-      "```",
+      "Example: `/?token=TOKEN&minutes=90`",
       "",
       "**`GET /unloaded`** — Mark the dishwasher as empty and ready to load",
-      "```",
-      "GET /unloaded?token=TOKEN",
-      "```",
+      "Example: `/unloaded?token=TOKEN`",
       "",
       "---",
       "",
@@ -441,17 +436,11 @@ async function maybePostDocs(env) {
       "",
       "**`GET /washer`** — Start a washer cycle",
       "- `minutes` — Estimated runtime *(optional, default: 45)*",
-      "```",
-      "GET /washer?token=TOKEN",
-      "GET /washer?token=TOKEN&minutes=60",
-      "```",
+      "Example: `/washer?token=TOKEN&minutes=60`",
       "",
       "**`GET /dryer`** — Start a dryer cycle *(clears washer done message)*",
       "- `minutes` — Estimated runtime *(optional, default: 45)*",
-      "```",
-      "GET /dryer?token=TOKEN",
-      "GET /dryer?token=TOKEN&minutes=60",
-      "```",
+      "Example: `/dryer?token=TOKEN&minutes=60`",
       "",
       "---",
       "",
@@ -469,25 +458,18 @@ async function maybePostDocs(env) {
       "",
       "**`GET /arrived`** — Mark someone as arrived home",
       "- `person` — e.g. `snake` *(required)*",
-      "```",
-      "GET /arrived?token=TOKEN&person=snake",
-      "```",
+      "Example: `/arrived?token=TOKEN&person=snake`",
       "",
       "**`GET /left`** — Mark someone as having left home",
       "- `person` — e.g. `snake` *(required)*",
       "- `destination` — e.g. `Walmart` *(optional)*",
-      "```",
-      "GET /left?token=TOKEN&person=snake",
-      "GET /left?token=TOKEN&person=snake&destination=Walmart",
-      "```",
+      "Example: `/left?token=TOKEN&person=snake&destination=Walmart`",
       "",
       "**`GET /location`** — Post a live location ping with Google Maps link",
       "- `person` — e.g. `snake` *(required)*",
       "- `lat` — Latitude *(required)*",
       "- `lon` — Longitude *(required)*",
-      "```",
-      "GET /location?token=TOKEN&person=snake&lat=39.9526&lon=-75.1652",
-      "```",
+      "Example: `/location?token=TOKEN&person=snake&lat=39.9526&lon=-75.1652`",
       "",
       "---",
       "",
@@ -534,9 +516,9 @@ export class TimerDO extends DurableObject {
       await setChannelName(env, CHANNEL_ID, "🏁", "dishwasher-alerts");
     } else if (type === "washer") {
       await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🫧 The washer was run at <t:${startTs}:F>.`);
-      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone 👕 The washer is DONE! Move it to the dryer.`);
+      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ⚠️ The washer is DONE! Move it to the dryer.`);
       await env.KV.put("washer_done_msg_id", data.id);
-      await setChannelName(env, LAUNDRY_CHANNEL_ID, "👕", "laundry-alerts");
+      await setChannelName(env, LAUNDRY_CHANNEL_ID, "⚠️", "laundry-alerts");
     } else if (type === "dryer") {
       await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🌀 The dryer was run at <t:${startTs}:F>.`);
       const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ✅ The dryer is DONE! Ready to fold.`);
@@ -574,7 +556,6 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // Handle Discord interactions
     if (path === "/interactions") {
       const bodyText = await verifyDiscordSignature(request, env);
       if (!bodyText) return new Response("Unauthorized", { status: 401 });
@@ -608,7 +589,6 @@ export default {
       return Response.json({ type: 1 });
     }
 
-    // All other paths require token
     if (url.searchParams.get("token") !== TOKEN) {
       return new Response("Unauthorized", { status: 401 });
     }
