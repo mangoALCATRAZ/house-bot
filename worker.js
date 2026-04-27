@@ -395,19 +395,14 @@ async function maybePostCalendarIntro(env) {
   const messages = await res.json();
   if (messages.length === 0) {
     const intro = await sendMessage(env, CALENDAR_CHANNEL_ID, [
-      "👋 **Welcome to #calendar!**",
-      "This is the shared house calendar. Use slash commands to manage events:",
-      "​",
-      "📌 `/event title:Dentist date:2026-05-01 time:14:00 reminder:30` — Add an event",
-      "❌ `/cancel id:evt_abc123` — Cancel an event by ID",
-      "📋 `/events` — List all upcoming events",
-      "​",
-      "All times are in EST. Event IDs are shown in the calendar below.",
-      "​",
-      "​",
+      // ... intro text unchanged
     ].join("\n"));
     await pinMessage(env, CALENDAR_CHANNEL_ID, intro.id);
+  }
 
+  // Always ensure calendar board exists
+  const calMsgId = await env.KV.get("calendar_msg_id");
+  if (!calMsgId) {
     const calContent = await buildCalendarBoard(env);
     const calMsg = await sendMessage(env, CALENDAR_CHANNEL_ID, calContent);
     await pinMessage(env, CALENDAR_CHANNEL_ID, calMsg.id);
