@@ -7,10 +7,13 @@ const DOCS_CHANNEL_ID = "1498080983570845816";
 const LAUNDRY_CHANNEL_ID = "1498166929343643790";
 const GENERAL_CHANNEL_ID = "1497871726162350180";
 const CALENDAR_CHANNEL_ID = "1498206238339760158";
+const DEV_CHANNEL_ID = "1497815253311029381";
 const APP_ID = "1497846686624776363";
 const API = "https://discord.com/api/v10";
 const TZ = "America/New_York";
 const GITHUB_URL = "https://github.com/mangoALCATRAZ/house-bot";
+
+let DEV_MODE = false;
 
 const PEOPLE = {
   "snake": "<@436947323445313536>",
@@ -26,15 +29,18 @@ function botHeaders(env) {
 }
 
 async function sendMessage(env, channelId, content) {
-  const res = await fetch(`${API}/channels/${channelId}/messages`, {
+  const targetChannel = DEV_MODE ? DEV_CHANNEL_ID : channelId;
+  const finalContent = DEV_MODE ? `[→ <#${channelId}>] ${content}` : content;
+  const res = await fetch(`${API}/channels/${targetChannel}/messages`, {
     method: "POST",
     headers: botHeaders(env),
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content: finalContent }),
   });
   return res.json();
 }
 
 async function editMessage(env, channelId, msgId, content) {
+  if (DEV_MODE) return;
   await fetch(`${API}/channels/${channelId}/messages/${msgId}`, {
     method: "PATCH",
     headers: botHeaders(env),
@@ -43,6 +49,7 @@ async function editMessage(env, channelId, msgId, content) {
 }
 
 async function deleteMessage(env, channelId, msgId) {
+  if (DEV_MODE) return;
   await fetch(`${API}/channels/${channelId}/messages/${msgId}`, {
     method: "DELETE",
     headers: botHeaders(env),
@@ -50,6 +57,7 @@ async function deleteMessage(env, channelId, msgId) {
 }
 
 async function pinMessage(env, channelId, msgId) {
+  if (DEV_MODE) return;
   await fetch(`${API}/channels/${channelId}/pins/${msgId}`, {
     method: "PUT",
     headers: botHeaders(env),
@@ -57,6 +65,7 @@ async function pinMessage(env, channelId, msgId) {
 }
 
 async function setChannelName(env, channelId, emoji, baseName) {
+  if (DEV_MODE) return;
   const res = await fetch(`${API}/channels/${channelId}`, {
     method: "PATCH",
     headers: botHeaders(env),
@@ -506,6 +515,10 @@ export class TimerDO extends DurableObject {
   async alarm() {
     const params = await this.ctx.storage.get("params");
     if (!params) return;
+
+    // Restore dev mode from when the timer was scheduled
+    DEV_MODE = params.devMode ?? false;
+
     const { type, msgid, startTs, eventId, eventTitle, eventTs } = params;
     const env = this.env;
 
@@ -544,7 +557,7 @@ async function scheduleTimer(env, type, delayMs, extras = {}) {
   const stub = env.TIMER.get(id);
   await stub.fetch("https://internal/set", {
     method: "POST",
-    body: JSON.stringify({ type, delayMs, ...extras }),
+    body: JSON.stringify({ type, delayMs, devMode: DEV_MODE, ...extras }),
   });
 }
 
@@ -592,6 +605,9 @@ export default {
     if (url.searchParams.get("token") !== TOKEN) {
       return new Response("Unauthorized", { status: 401 });
     }
+
+    // Set dev mode for this request
+    DEV_MODE = url.searchParams.get("dev") === "1";
 
     await maybePostDocs(env);
     await maybePostGeneral(env);
