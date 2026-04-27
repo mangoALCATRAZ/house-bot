@@ -13,3 +13,11 @@ class_name = "TimerDO"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["TimerDO"]
+
+[[durable_objects.bindings]]
+name = "CULLER"
+class_name = "CullDO"
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CullDO"]

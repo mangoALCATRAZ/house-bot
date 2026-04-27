@@ -1,6 +1,6 @@
 # 🤖 house-bot
 
-A Cloudflare Workers-powered Discord bot for household automation. Tracks the dishwasher, laundry, and who's home — triggered via Apple Shortcuts and NFC tags.
+A Cloudflare Workers-powered Discord bot for household automation. Tracks the dishwasher, laundry, and who's home — triggered via Apple Shortcuts and NFC tags. Features a shared calendar with Discord slash commands and automatic daily cleanup of old messages.
 
 ---
 
@@ -9,9 +9,11 @@ A Cloudflare Workers-powered Discord bot for household automation. Tracks the di
 - 🍽️ **Dishwasher alerts** — Notifies when the dishwasher is running, done, and ready to unload
 - 👕 **Laundry alerts** — Tracks washer and dryer cycles with timed notifications
 - 🏠 **Leave/Arrival alerts** — Notifies when someone leaves or arrives home with live location support and reverse geocoding via Google Maps
-- 📅 **Calendar** — Shared house calendar with Discord slash commands and timed reminders
+- 📅 **Calendar** — Shared house calendar with Discord slash commands (`/event`, `/cancel`, `/events`) and timed reminders
+- 🧹 **Auto-cleanup** — Deletes messages older than 7 days from alert channels every night at 3 AM EST, preserving pinned messages
 - 📌 **Pinned status boards** — Persistent pinned messages in each channel showing current state
 - 🔔 **Auto-intro messages** — Each channel gets a pinned welcome message on first use
+- 🧪 **Dev mode** — Redirect all messages to a spam channel with `?dev=1` for safe testing
 - ⏱️ **Precise timing** — Uses Cloudflare Durable Objects with alarms for exact notification timing
 
 ---
@@ -19,14 +21,14 @@ A Cloudflare Workers-powered Discord bot for household automation. Tracks the di
 ## Architecture
 
 ```
-Apple Shortcut / NFC Tag
+Apple Shortcut / NFC Tag / MacroDroid (Android)
         │
         ▼
 Cloudflare Worker (HTTP GET)
         │
         ├──▶ Discord REST API (messages, channel renames, pins)
         ├──▶ Cloudflare KV (state persistence)
-        ├──▶ Cloudflare Durable Objects (timed alarms)
+        ├──▶ Cloudflare Durable Objects (timed alarms + daily cull)
         └──▶ Google Maps Geocoding API (reverse geocoding)
 
 Discord Slash Commands (/event, /cancel, /events)
@@ -51,7 +53,7 @@ Cloudflare Worker (/interactions)
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/yourname/house-bot.git
+git clone https://github.com/mangoALCATRAZ/house-bot.git
 cd house-bot
 ```
 
@@ -59,8 +61,8 @@ cd house-bot
 
 ```toml
 name = "discord-shortcut"
-main = "src/index.js"
-compatibility_date = "2024-01-01"
+main = "worker.js"
+compatibility_date = "2025-04-26"
 
 [[kv_namespaces]]
 binding = "KV"
@@ -70,9 +72,17 @@ id = "YOUR_KV_NAMESPACE_ID"
 name = "TIMER"
 class_name = "TimerDO"
 
+[[durable_objects.bindings]]
+name = "CULLER"
+class_name = "CullDO"
+
 [[migrations]]
 tag = "v1"
-new_classes = ["TimerDO"]
+new_sqlite_classes = ["TimerDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CullDO"]
 ```
 
 ### 3. Set secrets
@@ -97,7 +107,7 @@ wrangler deploy
 
 ### 5. Register slash commands
 
-Run these one-time curl commands to register slash commands with Discord. Replace `YOUR_APP_ID` and `YOUR_BOT_TOKEN`:
+Run these one-time curl commands. Replace `YOUR_APP_ID` and `YOUR_BOT_TOKEN`:
 
 ```bash
 # /event
@@ -136,6 +146,14 @@ In your Discord app's **General Information**, set the **Interactions Endpoint U
 https://YOUR_WORKER_URL/interactions
 ```
 
+### 7. Kick off the daily culler
+
+Trigger any API endpoint once after deploying to start the `CullDO`:
+
+```
+https://YOUR_WORKER_URL/?token=TOKEN
+```
+
 ---
 
 ## API Reference
@@ -143,6 +161,8 @@ https://YOUR_WORKER_URL/interactions
 **Base URL:** `https://YOUR_WORKER_URL`
 
 All endpoints are HTTP GET requests and require `?token=TOKEN`.
+
+Add `&dev=1` to any request to redirect all messages to `#bot-development-spam` for testing (pings suppressed, channel renames skipped).
 
 ---
 
@@ -156,6 +176,7 @@ Start a dishwasher cycle.
 | `minutes` | int | No | `150` | Estimated runtime in minutes |
 
 ```
+GET /?token=TOKEN
 GET /?token=TOKEN&minutes=90
 ```
 
@@ -193,6 +214,20 @@ Start a dryer cycle. Automatically clears the washer done message.
 GET /dryer?token=TOKEN
 GET /dryer?token=TOKEN&minutes=60
 ```
+
+---
+
+### 📅 Calendar
+
+Calendar events are managed via Discord slash commands in `#calendar`. All times are in **EST**.
+
+| Command | Description |
+|---------|-------------|
+| `/event title date time [reminder]` | Add an event. Date: `YYYY-MM-DD`, time: `HH:MM` 24h |
+| `/cancel id` | Cancel an event by its ID |
+| `/events` | List all upcoming events |
+
+Event IDs are shown in the pinned calendar board and in the confirmation message when an event is created.
 
 ---
 
@@ -237,27 +272,15 @@ GET /location?token=TOKEN&person=snake&lat=39.9526&lon=-75.1652
 
 ---
 
-### 📅 Calendar
-
-Calendar events are managed via Discord slash commands in the `#calendar` channel.
-
-| Command | Description |
-|---------|-------------|
-| `/event title date time [reminder]` | Add an event. Date in `YYYY-MM-DD`, time in `HH:MM` 24h EST |
-| `/cancel id` | Cancel an event by its ID |
-| `/events` | List all upcoming events |
-
-All times are in **EST**. Event IDs are shown in the pinned calendar board.
-
----
-
 ## Supported People
 
-| Key | Description |
-|-----|-------------|
-| `snake` | Primary user |
+| Key | Discord |
+|-----|---------|
+| `snake` | @Snake |
+| `floogin` | @Floogin |
+| `toad` | @LocalToad |
 
-To add more people, update the `PEOPLE` object in `src/index.js`:
+To add more people, update the `PEOPLE` object in `worker.js`:
 
 ```javascript
 const PEOPLE = {
@@ -278,15 +301,49 @@ const PEOPLE = {
 | `#leave-arrival-alerts` | Who's home status board and location alerts |
 | `#calendar` | Upcoming events board and slash command interface |
 | `#bot-api-documentation` | Full API docs, auto-posted by the bot |
+| `#bot-development-spam` | Dev mode message sink (`?dev=1`) |
+
+---
+
+## Auto-Cleanup
+
+The `CullDO` Durable Object runs every night at **3 AM EST** and deletes messages older than 7 days from `#dishwasher-alerts`, `#laundry-alerts`, and `#leave-arrival-alerts`. Pinned messages are always preserved. `#calendar` is never culled.
+
+---
+
+## Dev Mode
+
+Add `?dev=1` to any API request to redirect all messages to `#bot-development-spam`:
+
+```
+/?token=TOKEN&minutes=1&dev=1
+```
+
+- All messages route to the dev channel with a `[→ #original-channel]` prefix
+- `@everyone` and `@here` pings are stripped
+- Channel renames are skipped
+- Timed followup messages (e.g. dishwasher done) also route to dev channel
+
+---
+
+## Android Setup (MacroDroid)
+
+Install **MacroDroid** from the Play Store (free, up to 5 macros).
+
+1. Open MacroDroid → **Add Macro**
+2. **Trigger**: choose NFC Tag, Location (geofence), or Shortcut/Widget
+3. **Action**: Connectivity → HTTP Request → Method: GET → paste URL
+4. Save and name the macro
+
+For geolocation triggers, use **Enter/Exit Area** with a 100–200m radius around the house.
 
 ---
 
 ## Bot Permissions
 
 The bot requires the following permissions in each channel:
-
 - **Send Messages**
-- **Manage Messages** (for pinning)
+- **Manage Messages** (for pinning and deletion)
 - **Read Message History**
 
 ---
@@ -300,6 +357,7 @@ The bot requires the following permissions in each channel:
 | `GOOGLE_MAPS_KEY` | Secret | Google Maps Geocoding API key |
 | `KV` | KV Binding | Cloudflare KV namespace for state persistence |
 | `TIMER` | DO Binding | Cloudflare Durable Object for timed alarms |
+| `CULLER` | DO Binding | Cloudflare Durable Object for daily message cleanup |
 
 ---
 

@@ -21,6 +21,9 @@ const PEOPLE = {
   "toad": "<@424005925859229696>",
 };
 
+const CULL_CHANNELS = [CHANNEL_ID, LAUNDRY_CHANNEL_ID, LOCATION_CHANNEL_ID];
+const CULL_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 function botHeaders(env) {
   return {
     "Authorization": `Bot ${env.DISCORD_TOKEN}`,
@@ -98,6 +101,78 @@ async function reverseGeocode(env, lat, lon) {
     return data.results[0].formatted_address;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Cull helpers
+// ---------------------------------------------------------------------------
+function getNext3AMEST() {
+  const now = new Date();
+  // Get current time in EST
+  const estNow = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
+  const next3AM = new Date(estNow);
+  next3AM.setHours(3, 0, 0, 0);
+  // If it's already past 3 AM today, schedule for tomorrow
+  if (estNow >= next3AM) next3AM.setDate(next3AM.getDate() + 1);
+  // Convert back to UTC ms
+  const tzOffset =
+    new Date(next3AM.toLocaleString("en-US", { timeZone: "UTC" })) -
+    new Date(next3AM.toLocaleString("en-US", { timeZone: TZ }));
+  return next3AM.getTime() + tzOffset;
+}
+
+async function getPinnedIds(env, channelId) {
+  const res = await fetch(`${API}/channels/${channelId}/pins`, {
+    headers: botHeaders(env),
+  });
+  const pins = await res.json();
+  return Array.isArray(pins) ? pins.map(p => p.id) : [];
+}
+
+async function cullChannel(env, channelId) {
+  const pinnedIds = await getPinnedIds(env, channelId);
+  const cutoff = Date.now() - CULL_AGE_MS;
+  let lastId = null;
+  let culled = 0;
+
+  while (true) {
+    const queryUrl = lastId
+      ? `${API}/channels/${channelId}/messages?limit=100&before=${lastId}`
+      : `${API}/channels/${channelId}/messages?limit=100`;
+
+    const res = await fetch(queryUrl, { headers: botHeaders(env) });
+    const messages = await res.json();
+
+    if (!Array.isArray(messages) || messages.length === 0) break;
+
+    for (const msg of messages) {
+      // Discord snowflake to timestamp
+      const msgTs = Number(BigInt(msg.id) >> 22n) + 1420070400000;
+      if (msgTs > cutoff) {
+        lastId = msg.id;
+        continue;
+      }
+      // Skip pinned messages
+      if (pinnedIds.includes(msg.id)) continue;
+      // Delete old non-pinned message
+      await fetch(`${API}/channels/${channelId}/messages/${msg.id}`, {
+        method: "DELETE",
+        headers: botHeaders(env),
+      });
+      culled++;
+      // Rate limit safety
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    // If last message in batch is older than cutoff, we're done
+    const oldest = messages[messages.length - 1];
+    const oldestTs = Number(BigInt(oldest.id) >> 22n) + 1420070400000;
+    if (oldestTs < cutoff) break;
+
+    lastId = oldest.id;
+  }
+
+  return culled;
 }
 
 // ---------------------------------------------------------------------------
@@ -395,12 +470,20 @@ async function maybePostCalendarIntro(env) {
   const messages = await res.json();
   if (messages.length === 0) {
     const intro = await sendMessage(env, CALENDAR_CHANNEL_ID, [
-      // ... intro text unchanged
+      "👋 **Welcome to #calendar!**",
+      "This is the shared house calendar. Use slash commands to manage events:",
+      "​",
+      "📌 `/event title:Dentist date:2026-05-01 time:14:00 reminder:30` — Add an event",
+      "❌ `/cancel id:evt_abc123` — Cancel an event by ID",
+      "📋 `/events` — List all upcoming events",
+      "​",
+      "All times are in EST. Event IDs are shown in the calendar below.",
+      "​",
+      "​",
     ].join("\n"));
     await pinMessage(env, CALENDAR_CHANNEL_ID, intro.id);
   }
 
-  // Always ensure calendar board exists
   const calMsgId = await env.KV.get("calendar_msg_id");
   if (!calMsgId) {
     const calContent = await buildCalendarBoard(env);
@@ -493,7 +576,43 @@ async function maybePostDocs(env) {
 }
 
 // ---------------------------------------------------------------------------
-// Durable Object
+// Cull DO — runs daily at 3 AM EST
+// ---------------------------------------------------------------------------
+export class CullDO extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    // Schedule first alarm for next 3 AM EST
+    const next3AM = getNext3AMEST();
+    await this.ctx.storage.setAlarm(next3AM);
+    return new Response("Culler scheduled");
+  }
+
+  async alarm() {
+    const env = this.env;
+    console.log("Running daily cull at 3 AM EST");
+
+    for (const channelId of CULL_CHANNELS) {
+      try {
+        const culled = await cullChannel(env, channelId);
+        console.log(`Culled ${culled} messages from ${channelId}`);
+      } catch (e) {
+        console.error(`Failed to cull ${channelId}:`, e);
+      }
+    }
+
+    // Schedule next run for 3 AM tomorrow
+    const next3AM = getNext3AMEST();
+    await this.ctx.storage.setAlarm(next3AM);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Timer DO
 // ---------------------------------------------------------------------------
 export class TimerDO extends DurableObject {
   constructor(ctx, env) {
@@ -513,7 +632,6 @@ export class TimerDO extends DurableObject {
     const params = await this.ctx.storage.get("params");
     if (!params) return;
 
-    // Restore dev mode from when the timer was scheduled
     DEV_MODE = params.devMode ?? false;
 
     const { type, msgid, startTs, eventId, eventTitle, eventTs } = params;
@@ -558,6 +676,18 @@ async function scheduleTimer(env, type, delayMs, extras = {}) {
   });
 }
 
+async function maybeStartCuller(env) {
+  const started = await env.KV.get("culler_started");
+  if (!started) {
+    const id = env.CULLER.newUniqueId();
+    const stub = env.CULLER.get(id);
+    await stub.fetch("https://internal/start", { method: "POST" });
+    await env.KV.put("culler_id", id.toString());
+    await env.KV.put("culler_started", "1");
+    console.log("Culler started, first run at next 3 AM EST");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main fetch handler
 // ---------------------------------------------------------------------------
@@ -578,22 +708,32 @@ export default {
 
       if (interaction.type === 2) {
         const { name, options = [] } = interaction.data;
-        let reply;
+        const token = interaction.token;
 
-        if (name === "event") {
-          reply = await handleEventCommand(env, options);
-        } else if (name === "cancel") {
-          reply = await handleCancelCommand(env, options);
-        } else if (name === "events") {
-          reply = await handleEventsCommand(env);
-        } else {
-          reply = "Unknown command.";
-        }
-
-        return Response.json({
-          type: 4,
-          data: { content: reply },
+        const response = new Response(JSON.stringify({ type: 5 }), {
+          headers: { "Content-Type": "application/json" },
         });
+
+        (async () => {
+          let reply;
+          if (name === "event") {
+            reply = await handleEventCommand(env, options);
+          } else if (name === "cancel") {
+            reply = await handleCancelCommand(env, options);
+          } else if (name === "events") {
+            reply = await handleEventsCommand(env);
+          } else {
+            reply = "Unknown command.";
+          }
+
+          await fetch(`${API}/webhooks/${APP_ID}/${token}/messages/@original`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: reply }),
+          });
+        })();
+
+        return response;
       }
 
       return Response.json({ type: 1 });
@@ -603,11 +743,11 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    // Set dev mode for this request
     DEV_MODE = url.searchParams.get("dev") === "1";
 
     await maybePostDocs(env);
     await maybePostGeneral(env);
+    await maybeStartCuller(env);
 
     if (path === "/unloaded") {
       const doneMsgId = await env.KV.get("done_msg_id");
