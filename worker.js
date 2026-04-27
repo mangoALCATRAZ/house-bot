@@ -98,12 +98,12 @@ async function verifyDiscordSignature(request, env) {
   const key = await crypto.subtle.importKey(
     "raw",
     hexToBytes(env.DISCORD_PUBLIC_KEY),
-    { name: "NODE-ED25519", namedCurve: "ED25519" },
+    { name: "Ed25519", namedCurve: "Ed25519" },
     false,
     ["verify"]
   );
   const valid = await crypto.subtle.verify(
-    "NODE-ED25519",
+    { name: "Ed25519" },
     key,
     hexToBytes(signature),
     new TextEncoder().encode(timestamp + body)
@@ -570,12 +570,10 @@ export default {
 
       const interaction = JSON.parse(bodyText);
 
-      // Discord ping verification
       if (interaction.type === 1) {
         return Response.json({ type: 1 });
       }
 
-      // Slash commands
       if (interaction.type === 2) {
         const { name, options = [] } = interaction.data;
         let reply;
