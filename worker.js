@@ -686,7 +686,7 @@ async function maybeStartCuller(env) {
 // Main fetch handler
 // ---------------------------------------------------------------------------
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -708,7 +708,7 @@ export default {
           headers: { "Content-Type": "application/json" },
         });
 
-        (async () => {
+        ctx.waitUntil((async () => {
           let reply;
           if (name === "event") {
             reply = await handleEventCommand(env, options);
@@ -725,7 +725,7 @@ export default {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ content: reply }),
           });
-        })();
+        })());
 
         return response;
       }
