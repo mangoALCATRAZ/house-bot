@@ -806,23 +806,36 @@ export default {
       return new Response("Done!");
     }
 
-    if (path === "/location") {
-      const personRaw = url.searchParams.get("person");
-      const lat = url.searchParams.get("lat");
-      const lon = url.searchParams.get("lon");
-      if (!personRaw || !lat || !lon) return new Response("Missing person, lat, or lon", { status: 400 });
-      const person = PEOPLE[personRaw.toLowerCase()] ?? personRaw;
-      const key = personRaw.toLowerCase();
-      const ts = Math.floor(Date.now() / 1000);
-      const mapsLink = `https://www.google.com/maps?q=${lat},${lon}`;
-      const place = await reverseGeocode(env, lat, lon);
-      const placeText = place ? ` (${place})` : "";
-      await env.KV.put(`status_${key}`, JSON.stringify({ type: "location", ts, mapsLink, place }));
-      await maybePostLocationIntro(env);
-      await sendMessage(env, LOCATION_CHANNEL_ID, `🌐 ${person} is here!${placeText} ${mapsLink} (@here)`);
-      await updateStatusBoard(env);
-      return new Response("Done!");
-    }
+     if (path === "/location") {
+  const personRaw = url.searchParams.get("person");
+  const lat = url.searchParams.get("lat");
+  const lon = url.searchParams.get("lon");
+  const address = url.searchParams.get("address");
+
+  if (!personRaw) return new Response("Missing person", { status: 400 });
+  if (!address && (!lat || !lon)) return new Response("Missing lat/lon or address", { status: 400 });
+
+  const person = PEOPLE[personRaw.toLowerCase()] ?? personRaw;
+  const key = personRaw.toLowerCase();
+  const ts = Math.floor(Date.now() / 1000);
+
+  let mapsLink, placeText;
+
+  if (address) {
+    mapsLink = `https://www.google.com/maps?q=${encodeURIComponent(address)}`;
+    placeText = ` (${address})`;
+  } else {
+    mapsLink = `https://www.google.com/maps?q=${lat},${lon}`;
+    const place = await reverseGeocode(env, lat, lon);
+    placeText = place ? ` (${place})` : "";
+  }
+
+  await env.KV.put(`status_${key}`, JSON.stringify({ type: "location", ts, mapsLink, place: placeText.replace(/[()]/g, "").trim() }));
+  await maybePostLocationIntro(env);
+  await sendMessage(env, LOCATION_CHANNEL_ID, `🌐 ${person} is here!${placeText} ${mapsLink} (@here)`);
+  await updateStatusBoard(env);
+  return new Response("Done!");
+}  
 
     // /run — default dishwasher path
     const emptyMsgId = await env.KV.get("empty_msg_id");
