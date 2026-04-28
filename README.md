@@ -7,8 +7,8 @@ A Cloudflare Workers-powered Discord bot for household automation. Tracks the di
 ## Features
 
 - 🍽️ **Dishwasher alerts** — Notifies when the dishwasher is running, done, and ready to unload
-- 👕 **Laundry alerts** — Tracks washer and dryer cycles with timed notifications
-- 🏠 **Leave/Arrival alerts** — Notifies when someone leaves or arrives home with live location support and reverse geocoding via Google Maps
+- 👕 **Laundry alerts** — Tracks washer and dryer cycles with timed notifications, supports concurrent loads
+- 🏠 **Leave/Arrival alerts** — Notifies when someone leaves or arrives home with live location support via GPS coords or address string
 - 📅 **Calendar** — Shared house calendar with Discord slash commands (`/event`, `/cancel`, `/events`) and timed reminders
 - 🧹 **Auto-cleanup** — Deletes messages older than 7 days from alert channels every night at 3 AM EST, preserving pinned messages
 - 📌 **Pinned status boards** — Persistent pinned messages in each channel showing current state
@@ -191,6 +191,8 @@ GET /unloaded?token=TOKEN
 
 ### 👕 Laundry
 
+Concurrent washer and dryer loads are supported — starting one does not affect the other's timer.
+
 #### `GET /washer`
 Start a washer cycle.
 
@@ -204,7 +206,7 @@ GET /washer?token=TOKEN&minutes=60
 ```
 
 #### `GET /dryer`
-Start a dryer cycle. Automatically clears the washer done message.
+Start a dryer cycle.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -258,17 +260,26 @@ GET /left?token=TOKEN&person=snake&destination=Walmart
 ```
 
 #### `GET /location`
-Post a live location ping with a Google Maps link and reverse-geocoded place name.
+Post a live location ping with a Google Maps link. Accepts either GPS coordinates or a URL-encoded address string.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `person` | string | Yes | Person key |
-| `lat` | float | Yes | Latitude |
-| `lon` | float | Yes | Longitude |
+| `lat` | float | No* | Latitude |
+| `lon` | float | No* | Longitude |
+| `address` | string | No* | URL-encoded address string |
+
+*Either `lat`/`lon` or `address` is required.
 
 ```
+# GPS coords
 GET /location?token=TOKEN&person=snake&lat=39.9526&lon=-75.1652
+
+# Address string (URL-encoded)
+GET /location?token=TOKEN&person=snake&address=1600%20Pennsylvania%20Ave%20Washington%20DC
 ```
+
+**Apple Shortcuts tip:** Use the **Encode URL** action on the address variable before embedding it in the URL, then combine with a **Text** action.
 
 ---
 

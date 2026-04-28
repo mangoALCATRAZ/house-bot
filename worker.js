@@ -1,29 +1,63 @@
 import { DurableObject } from "cloudflare:workers";
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// API auth token for HTTP endpoints (passed as ?token=TOKEN in requests)
 const TOKEN = "VXHeXQe7dn2SGMSK5B";
-const CHANNEL_ID = "1497845829938188339";
-const LOCATION_CHANNEL_ID = "1498080106927886355";
-const DOCS_CHANNEL_ID = "1498080983570845816";
-const LAUNDRY_CHANNEL_ID = "1498166929343643790";
-const GENERAL_CHANNEL_ID = "1497871726162350180";
-const CALENDAR_CHANNEL_ID = "1498206238339760158";
-const DEV_CHANNEL_ID = "1497815253311029381";
-const APP_ID = "1497846686624776363";
-const API = "https://discord.com/api/v10";
-const TZ = "America/New_York";
+
+// Discord channel IDs
+const CHANNEL_ID = "1497845829938188339";           // #dishwasher-alerts
+const LOCATION_CHANNEL_ID = "1498080106927886355";  // #leave-arrival-alerts
+const DOCS_CHANNEL_ID = "1498080983570845816";      // #bot-api-documentation
+const LAUNDRY_CHANNEL_ID = "1498166929343643790";   // #laundry-alerts
+const GENERAL_CHANNEL_ID = "1497871726162350180";   // #general
+const CALENDAR_CHANNEL_ID = "1498206238339760158";  // #calendar
+const DEV_CHANNEL_ID = "1497815253311029381";       // #bot-development-spam
+
+// Discord app/API config
+const APP_ID = "1497846686624776363";               // Discord application ID
+const API = "https://discord.com/api/v10";          // Discord REST API base URL
+const TZ = "America/New_York";                      // Timezone for calendar and cull scheduling
+
+// GitHub repo URL included in API docs
 const GITHUB_URL = "https://github.com/mangoALCATRAZ/house-bot";
 
+// When true, all messages are redirected to #bot-development-spam.
+// Set per-request via ?dev=1 query param. Also stored in timer params
+// so timed followup messages (e.g. "dishwasher done") also redirect.
 let DEV_MODE = false;
 
+// ---------------------------------------------------------------------------
+// People
+// ---------------------------------------------------------------------------
+// Map of person keys (used in API params) to Discord mention strings.
+// Add new housemates here. Keys are case-insensitive.
+// Example: "peter": "<@123456789>"
 const PEOPLE = {
   "snake": "<@436947323445313536>",
   "floogin": "<@209825795852599297>",
   "toad": "<@424005925859229696>",
 };
 
+// ---------------------------------------------------------------------------
+// Cull config
+// ---------------------------------------------------------------------------
+// Channels to include in the nightly 3 AM message cull (excludes #calendar)
 const CULL_CHANNELS = [CHANNEL_ID, LAUNDRY_CHANNEL_ID, LOCATION_CHANNEL_ID];
-const CULL_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Age threshold for nightly cull — messages older than this are deleted
+const CULL_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+// How long laundry "done" messages persist before being auto-deleted
+const LAUNDRY_DONE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+// ---------------------------------------------------------------------------
+// Discord API helpers
+// ---------------------------------------------------------------------------
+
+// Returns auth headers for bot API requests
 function botHeaders(env) {
   return {
     "Authorization": `Bot ${env.DISCORD_TOKEN}`,
@@ -31,6 +65,8 @@ function botHeaders(env) {
   };
 }
 
+// Posts a message to a Discord channel.
+// In DEV_MODE, redirects to #bot-development-spam and strips @everyone/@here.
 async function sendMessage(env, channelId, content) {
   const targetChannel = DEV_MODE ? DEV_CHANNEL_ID : channelId;
   let finalContent = DEV_MODE
@@ -44,6 +80,7 @@ async function sendMessage(env, channelId, content) {
   return res.json();
 }
 
+// Edits an existing message. Skipped in DEV_MODE.
 async function editMessage(env, channelId, msgId, content) {
   if (DEV_MODE) return;
   await fetch(`${API}/channels/${channelId}/messages/${msgId}`, {
@@ -53,6 +90,7 @@ async function editMessage(env, channelId, msgId, content) {
   });
 }
 
+// Deletes a message. Skipped in DEV_MODE.
 async function deleteMessage(env, channelId, msgId) {
   if (DEV_MODE) return;
   await fetch(`${API}/channels/${channelId}/messages/${msgId}`, {
@@ -61,6 +99,7 @@ async function deleteMessage(env, channelId, msgId) {
   });
 }
 
+// Pins a message to a channel. Skipped in DEV_MODE.
 async function pinMessage(env, channelId, msgId) {
   if (DEV_MODE) return;
   await fetch(`${API}/channels/${channelId}/pins/${msgId}`, {
@@ -69,6 +108,8 @@ async function pinMessage(env, channelId, msgId) {
   });
 }
 
+// Renames a channel with an emoji prefix, e.g. "🔴dishwasher-alerts".
+// Handles rate limiting with a single retry. Skipped in DEV_MODE.
 async function setChannelName(env, channelId, emoji, baseName) {
   if (DEV_MODE) return;
   const res = await fetch(`${API}/channels/${channelId}`, {
@@ -88,6 +129,13 @@ async function setChannelName(env, channelId, emoji, baseName) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Google Maps
+// ---------------------------------------------------------------------------
+
+// Converts GPS coordinates to a human-readable address using the
+// Google Maps Geocoding API. Prefers named establishments over street addresses.
+// Returns null if geocoding fails or no results are found.
 async function reverseGeocode(env, lat, lon) {
   const res = await fetch(
     `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lon}&key=${env.GOOGLE_MAPS_KEY}`
@@ -106,6 +154,9 @@ async function reverseGeocode(env, lat, lon) {
 // ---------------------------------------------------------------------------
 // Cull helpers
 // ---------------------------------------------------------------------------
+
+// Calculates the UTC timestamp for the next 3 AM EST/EDT occurrence.
+// Used by CullDO to schedule its nightly alarm.
 function getNext3AMEST() {
   const now = new Date();
   const estNow = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
@@ -118,6 +169,8 @@ function getNext3AMEST() {
   return next3AM.getTime() + tzOffset;
 }
 
+// Fetches all pinned message IDs for a channel.
+// Used by cullChannel to avoid deleting pinned intro/status messages.
 async function getPinnedIds(env, channelId) {
   const res = await fetch(`${API}/channels/${channelId}/pins`, {
     headers: botHeaders(env),
@@ -126,6 +179,9 @@ async function getPinnedIds(env, channelId) {
   return Array.isArray(pins) ? pins.map(p => p.id) : [];
 }
 
+// Deletes all non-pinned messages older than CULL_AGE_MS from a channel.
+// Paginates through messages in batches of 100, stopping when all remaining
+// messages are newer than the cutoff. Rate-limited to 500ms between deletes.
 async function cullChannel(env, channelId) {
   const pinnedIds = await getPinnedIds(env, channelId);
   const cutoff = Date.now() - CULL_AGE_MS;
@@ -143,6 +199,7 @@ async function cullChannel(env, channelId) {
     if (!Array.isArray(messages) || messages.length === 0) break;
 
     for (const msg of messages) {
+      // Extract timestamp from Discord snowflake ID
       const msgTs = Number(BigInt(msg.id) >> 22n) + 1420070400000;
       if (msgTs > cutoff) {
         lastId = msg.id;
@@ -169,6 +226,10 @@ async function cullChannel(env, channelId) {
 // ---------------------------------------------------------------------------
 // Discord interaction signature verification
 // ---------------------------------------------------------------------------
+
+// Verifies that an incoming /interactions POST request is genuinely from Discord
+// using Ed25519 signature verification. Returns the raw body string if valid,
+// false if invalid. Required by Discord for all interaction endpoints.
 async function verifyDiscordSignature(request, env) {
   const signature = request.headers.get("x-signature-ed25519");
   const timestamp = request.headers.get("x-signature-timestamp");
@@ -191,6 +252,7 @@ async function verifyDiscordSignature(request, env) {
   return valid ? body : false;
 }
 
+// Converts a hex string to a Uint8Array, used for Ed25519 key/signature parsing.
 function hexToBytes(hex) {
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) {
@@ -202,6 +264,9 @@ function hexToBytes(hex) {
 // ---------------------------------------------------------------------------
 // Calendar helpers
 // ---------------------------------------------------------------------------
+
+// Parses a date (YYYY-MM-DD) and time (HH:MM) string in EST/EDT
+// and returns a UTC Date object.
 function parseEventTime(date, time) {
   const localDate = new Date(`${date}T${time}:00`);
   const tzOffset =
@@ -210,15 +275,19 @@ function parseEventTime(date, time) {
   return new Date(localDate.getTime() + tzOffset);
 }
 
+// Retrieves the calendar event list from KV. Returns [] if none exist.
 async function getEvents(env) {
   const raw = await env.KV.get("calendar_events");
   return raw ? JSON.parse(raw) : [];
 }
 
+// Saves the calendar event list to KV.
 async function saveEvents(env, events) {
   await env.KV.put("calendar_events", JSON.stringify(events));
 }
 
+// Removes events whose timestamp has passed and saves the updated list.
+// Returns the list of upcoming (non-expired) events.
 async function pruneExpiredEvents(env) {
   const events = await getEvents(env);
   const now = Date.now();
@@ -227,6 +296,8 @@ async function pruneExpiredEvents(env) {
   return upcoming;
 }
 
+// Builds the pinned calendar board message content showing all upcoming events,
+// sorted by date. Shows event title, timestamp, reminder, and ID.
 async function buildCalendarBoard(env) {
   const events = await pruneExpiredEvents(env);
   const lines = ["📅 **Upcoming Events**", "​"];
@@ -248,6 +319,7 @@ async function buildCalendarBoard(env) {
   return lines.join("\n");
 }
 
+// Edits the pinned calendar board message with the latest event list.
 async function updateCalendarBoard(env) {
   const calMsgId = await env.KV.get("calendar_msg_id");
   const content = await buildCalendarBoard(env);
@@ -257,6 +329,9 @@ async function updateCalendarBoard(env) {
 // ---------------------------------------------------------------------------
 // Slash command handlers
 // ---------------------------------------------------------------------------
+
+// Handles /event — validates input, stores event in KV, schedules reminder
+// and expiry timers, updates the calendar board, and posts a confirmation.
 async function handleEventCommand(env, options) {
   const title = options.find(o => o.name === "title")?.value;
   const date = options.find(o => o.name === "date")?.value;
@@ -283,6 +358,7 @@ async function handleEventCommand(env, options) {
   events.push({ id, title, ts: eventTs, reminder });
   await saveEvents(env, events);
 
+  // Schedule reminder (fires X minutes before the event)
   const reminderDelay = eventTs - now - reminder * 60 * 1000;
   if (reminderDelay > 0) {
     await scheduleTimer(env, "event_reminder", reminderDelay, {
@@ -290,6 +366,7 @@ async function handleEventCommand(env, options) {
     });
   }
 
+  // Schedule expiry cleanup (fires 1 minute after event time)
   await scheduleTimer(env, "event_expire", eventTs - now + 60000, { eventId: id });
   await updateCalendarBoard(env);
   await sendMessage(env, CALENDAR_CHANNEL_ID, `@here 📅 New event added: **${title}** — <t:${Math.floor(eventTs / 1000)}:F> 🔔 Reminder ${reminder} min before. 🆔 \`${id}\``);
@@ -297,6 +374,8 @@ async function handleEventCommand(env, options) {
   return `✅ Event **${title}** added for <t:${Math.floor(eventTs / 1000)}:F>! ID: \`${id}\``;
 }
 
+// Handles /cancel — removes an event from KV by ID, updates the board,
+// and posts a cancellation notice to #calendar.
 async function handleCancelCommand(env, options) {
   const id = options.find(o => o.name === "id")?.value;
   if (!id) return "❌ Missing event ID.";
@@ -313,6 +392,8 @@ async function handleCancelCommand(env, options) {
   return `✅ Event **${removed.title}** cancelled.`;
 }
 
+// Handles /events — returns a formatted list of upcoming events as an
+// ephemeral-style reply (only visible to the user who ran the command).
 async function handleEventsCommand(env) {
   const events = await pruneExpiredEvents(env);
   if (events.length === 0) return "📅 No upcoming events.";
@@ -327,8 +408,11 @@ async function handleEventsCommand(env) {
 }
 
 // ---------------------------------------------------------------------------
-// Status board
+// Status board (#leave-arrival-alerts)
 // ---------------------------------------------------------------------------
+
+// Builds the pinned status board message content showing the current
+// location/status of all people in PEOPLE. Shows home, out, or last seen.
 async function buildStatusBoard(env) {
   const lines = ["📊 **Current Status**"];
   for (const key of Object.keys(PEOPLE)) {
@@ -354,6 +438,7 @@ async function buildStatusBoard(env) {
   return lines.join("\n");
 }
 
+// Edits the pinned status board message with the latest status for all people.
 async function updateStatusBoard(env) {
   const statusMsgId = await env.KV.get("status_msg_id");
   const content = await buildStatusBoard(env);
@@ -361,8 +446,12 @@ async function updateStatusBoard(env) {
 }
 
 // ---------------------------------------------------------------------------
-// Intro posts
+// Channel intro posts
+// All maybePost* functions check if the channel is empty before posting.
+// They are idempotent — safe to call on every request.
 // ---------------------------------------------------------------------------
+
+// Posts the #general intro message and pins it. Only fires if #general is empty.
 async function maybePostGeneral(env) {
   const res = await fetch(`${API}/channels/${GENERAL_CHANNEL_ID}/messages?limit=1`, {
     headers: botHeaders(env),
@@ -385,6 +474,7 @@ async function maybePostGeneral(env) {
   }
 }
 
+// Posts the #dishwasher-alerts intro and pins it. Only fires if channel is empty.
 async function maybePostIntro(env) {
   const res = await fetch(`${API}/channels/${CHANNEL_ID}/messages?limit=1`, {
     headers: botHeaders(env),
@@ -406,6 +496,8 @@ async function maybePostIntro(env) {
   }
 }
 
+// Posts the #leave-arrival-alerts intro and pins it, then posts and pins
+// the initial status board. Only fires if channel is empty.
 async function maybePostLocationIntro(env) {
   const res = await fetch(`${API}/channels/${LOCATION_CHANNEL_ID}/messages?limit=1`, {
     headers: botHeaders(env),
@@ -432,6 +524,7 @@ async function maybePostLocationIntro(env) {
   }
 }
 
+// Posts the #laundry-alerts intro and pins it. Only fires if channel is empty.
 async function maybePostLaundryIntro(env) {
   const res = await fetch(`${API}/channels/${LAUNDRY_CHANNEL_ID}/messages?limit=1`, {
     headers: botHeaders(env),
@@ -454,6 +547,9 @@ async function maybePostLaundryIntro(env) {
   }
 }
 
+// Posts the #calendar intro and pins it. Also ensures the pinned calendar
+// board exists — creates and pins it if calendar_msg_id is not in KV.
+// The board check runs even if the intro has already been posted.
 async function maybePostCalendarIntro(env) {
   const res = await fetch(`${API}/channels/${CALENDAR_CHANNEL_ID}/messages?limit=1`, {
     headers: botHeaders(env),
@@ -475,6 +571,7 @@ async function maybePostCalendarIntro(env) {
     await pinMessage(env, CALENDAR_CHANNEL_ID, intro.id);
   }
 
+  // Always ensure the pinned calendar board exists, even if intro was already posted
   const calMsgId = await env.KV.get("calendar_msg_id");
   if (!calMsgId) {
     const calContent = await buildCalendarBoard(env);
@@ -484,6 +581,8 @@ async function maybePostCalendarIntro(env) {
   }
 }
 
+// Posts the #bot-api-documentation message and pins it.
+// Only fires if the channel is empty.
 async function maybePostDocs(env) {
   const res = await fetch(`${API}/channels/${DOCS_CHANNEL_ID}/messages?limit=1`, {
     headers: botHeaders(env),
@@ -548,9 +647,11 @@ async function maybePostDocs(env) {
       "",
       "**`GET /location`** — Post a live location ping with Google Maps link",
       "- `person` — e.g. `snake` *(required)*",
-      "- `lat` — Latitude *(required)*",
-      "- `lon` — Longitude *(required)*",
-      "Example: `/location?token=TOKEN&person=snake&lat=39.9526&lon=-75.1652`",
+      "- `lat` + `lon` — GPS coordinates *(optional)*",
+      "- `address` — URL-encoded address string *(optional)*",
+      "- Either `lat`/`lon` or `address` is required",
+      "Example (GPS): `/location?token=TOKEN&person=snake&lat=39.9526&lon=-75.1652`",
+      "Example (address): `/location?token=TOKEN&person=snake&address=1600%20Pennsylvania%20Ave`",
       "",
       "---",
       "",
@@ -563,6 +664,7 @@ async function maybePostDocs(env) {
       "",
       "## 🧹 Auto-Cleanup",
       "Alert channels are cleaned up every night at **3 AM EST**. Messages older than 7 days are deleted. Pinned messages are always preserved. #calendar is never culled.",
+      "Laundry done messages are automatically deleted after **2 hours**.",
       "",
       "---",
       "",
@@ -573,8 +675,12 @@ async function maybePostDocs(env) {
 }
 
 // ---------------------------------------------------------------------------
-// Cull DO
+// Durable Objects
 // ---------------------------------------------------------------------------
+
+// CullDO — runs once daily at 3 AM EST to delete old messages.
+// Started once via maybeStartCuller() on first API invocation.
+// Reschedules itself after each run.
 export class CullDO extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -582,12 +688,14 @@ export class CullDO extends DurableObject {
     this.env = env;
   }
 
+  // Called once to schedule the first alarm
   async fetch(request) {
     const next3AM = getNext3AMEST();
     await this.ctx.storage.setAlarm(next3AM);
     return new Response("Culler scheduled");
   }
 
+  // Runs at 3 AM EST, culls all CULL_CHANNELS, reschedules for next day
   async alarm() {
     const env = this.env;
     console.log("Running daily cull at 3 AM EST");
@@ -606,9 +714,12 @@ export class CullDO extends DurableObject {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Timer DO
-// ---------------------------------------------------------------------------
+// TimerDO — general-purpose timed alarm for all delayed actions:
+// - dishwasher/washer/dryer done notifications
+// - laundry done message auto-delete (after LAUNDRY_DONE_TTL_MS)
+// - calendar event reminders
+// - calendar event expiry cleanup
+// Each timer is a separate DO instance with its own storage and alarm.
 export class TimerDO extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -616,6 +727,7 @@ export class TimerDO extends DurableObject {
     this.env = env;
   }
 
+  // Stores params and sets the alarm for delayMs milliseconds from now
   async fetch(request) {
     const params = await request.json();
     await this.ctx.storage.put("params", params);
@@ -623,6 +735,8 @@ export class TimerDO extends DurableObject {
     return new Response("OK");
   }
 
+  // Fires when the alarm triggers. Restores DEV_MODE from stored params
+  // so dev-mode timed messages also route to #bot-development-spam.
   async alarm() {
     const params = await this.ctx.storage.get("params");
     if (!params) return;
@@ -633,27 +747,46 @@ export class TimerDO extends DurableObject {
     const env = this.env;
 
     if (type === "dishwasher") {
+      // Edit the running message to show when it ran, then post done alert
       await editMessage(env, CHANNEL_ID, msgid, `🫧 The dishwasher was run at <t:${startTs}:F>.`);
       const data = await sendMessage(env, CHANNEL_ID, `@everyone 🏁 The dishwasher is DONE! Ready to unload!`);
       await env.KV.put("done_msg_id", data.id);
       await setChannelName(env, CHANNEL_ID, "🏁", "dishwasher-alerts");
     } else if (type === "washer") {
+      // Edit the running message, post done alert, schedule auto-delete in 2hrs
       await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🫧 The washer was run at <t:${startTs}:F>.`);
       const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ⚠️ The washer is DONE! Move it to the dryer.`);
       await env.KV.put(`washer_done_msg_${msgid}`, data.id);
       await setChannelName(env, LAUNDRY_CHANNEL_ID, "⚠️", "laundry-alerts");
+      await scheduleTimer(env, "delete_msg", LAUNDRY_DONE_TTL_MS, {
+        channelId: LAUNDRY_CHANNEL_ID,
+        deleteTargetMsgId: data.id,
+      });
     } else if (type === "dryer") {
+      // Edit the running message, post done alert, schedule auto-delete in 2hrs
       await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🌀 The dryer was run at <t:${startTs}:F>.`);
       const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ✅ The dryer is DONE! Ready to fold.`);
       await env.KV.put(`dryer_done_msg_${msgid}`, data.id);
       await setChannelName(env, LAUNDRY_CHANNEL_ID, "✅", "laundry-alerts");
+      await scheduleTimer(env, "delete_msg", LAUNDRY_DONE_TTL_MS, {
+        channelId: LAUNDRY_CHANNEL_ID,
+        deleteTargetMsgId: data.id,
+      });
+    } else if (type === "delete_msg") {
+      // Deletes a specific message — used for laundry done auto-cleanup
+      await fetch(`${API}/channels/${params.channelId}/messages/${params.deleteTargetMsgId}`, {
+        method: "DELETE",
+        headers: botHeaders(env),
+      });
     } else if (type === "event_reminder") {
+      // Posts a reminder to #calendar if the event still exists (wasn't cancelled)
       const events = await getEvents(env);
       const event = events.find(e => e.id === eventId);
       if (event) {
         await sendMessage(env, CALENDAR_CHANNEL_ID, `@everyone 🔔 Reminder: **${eventTitle}** is starting <t:${Math.floor(eventTs / 1000)}:R>!`);
       }
     } else if (type === "event_expire") {
+      // Prunes expired events from KV and updates the calendar board
       await pruneExpiredEvents(env);
       await updateCalendarBoard(env);
     }
@@ -662,6 +795,8 @@ export class TimerDO extends DurableObject {
   }
 }
 
+// Creates a new TimerDO instance and schedules it to fire after delayMs.
+// extras are merged into the stored params and available in the alarm handler.
 async function scheduleTimer(env, type, delayMs, extras = {}) {
   const id = env.TIMER.newUniqueId();
   const stub = env.TIMER.get(id);
@@ -671,6 +806,8 @@ async function scheduleTimer(env, type, delayMs, extras = {}) {
   });
 }
 
+// Starts the CullDO on first API invocation. Uses KV flag "culler_started"
+// to ensure it's only initialized once across all worker instances.
 async function maybeStartCuller(env) {
   const started = await env.KV.get("culler_started");
   if (!started) {
@@ -690,24 +827,34 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // ---------------------------------------------------------------------------
+    // Discord interactions endpoint (/interactions)
+    // Handles slash commands from Discord. Must respond within 3 seconds,
+    // so we return a deferred response (type 5) immediately and do work
+    // async via ctx.waitUntil(), then edit the response via webhook.
+    // ---------------------------------------------------------------------------
     if (path === "/interactions") {
       const bodyText = await verifyDiscordSignature(request, env);
       if (!bodyText) return new Response("Unauthorized", { status: 401 });
 
       const interaction = JSON.parse(bodyText);
 
+      // Type 1 = Discord ping verification (required during setup)
       if (interaction.type === 1) {
         return Response.json({ type: 1 });
       }
 
+      // Type 2 = slash command
       if (interaction.type === 2) {
         const { name, options = [] } = interaction.data;
         const token = interaction.token;
 
+        // Respond immediately with "thinking..." to avoid 3s timeout
         const response = new Response(JSON.stringify({ type: 5 }), {
           headers: { "Content-Type": "application/json" },
         });
 
+        // Do actual work after responding, keeping worker alive with waitUntil
         ctx.waitUntil((async () => {
           let reply;
           if (name === "event") {
@@ -720,6 +867,7 @@ export default {
             reply = "Unknown command.";
           }
 
+          // Edit the deferred "thinking..." message with the actual reply
           await fetch(`${API}/webhooks/${APP_ID}/${token}/messages/@original`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
@@ -733,15 +881,22 @@ export default {
       return Response.json({ type: 1 });
     }
 
+    // ---------------------------------------------------------------------------
+    // HTTP API endpoints — all require ?token=TOKEN
+    // ---------------------------------------------------------------------------
     if (url.searchParams.get("token") !== TOKEN) {
       return new Response("Unauthorized", { status: 401 });
     }
 
+    // Set dev mode for this request (persists into timer params for followups)
     DEV_MODE = url.searchParams.get("dev") === "1";
 
+    // Run on every request — idempotent, only posts if channels are empty
     await maybePostDocs(env);
     await maybePostGeneral(env);
     await maybeStartCuller(env);
+
+    // --- Dishwasher ---
 
     if (path === "/unloaded") {
       const doneMsgId = await env.KV.get("done_msg_id");
@@ -751,6 +906,10 @@ export default {
       await setChannelName(env, CHANNEL_ID, "🟩", "dishwasher-alerts");
       return new Response("Done!");
     }
+
+    // --- Laundry ---
+    // Note: washer and dryer are fully independent — starting one does not
+    // affect the other's timer or messages. Concurrent loads are supported.
 
     if (path === "/washer") {
       await maybePostLaundryIntro(env);
@@ -773,6 +932,8 @@ export default {
       await scheduleTimer(env, "dryer", minutes * 60 * 1000, { msgid: data.id, startTs });
       return new Response("Started!");
     }
+
+    // --- Leave/Arrival ---
 
     if (path === "/arrived") {
       const personRaw = url.searchParams.get("person");
@@ -806,38 +967,42 @@ export default {
       return new Response("Done!");
     }
 
-     if (path === "/location") {
-  const personRaw = url.searchParams.get("person");
-  const lat = url.searchParams.get("lat");
-  const lon = url.searchParams.get("lon");
-  const address = url.searchParams.get("address");
+    if (path === "/location") {
+      const personRaw = url.searchParams.get("person");
+      const lat = url.searchParams.get("lat");
+      const lon = url.searchParams.get("lon");
+      const address = url.searchParams.get("address");
 
-  if (!personRaw) return new Response("Missing person", { status: 400 });
-  if (!address && (!lat || !lon)) return new Response("Missing lat/lon or address", { status: 400 });
+      if (!personRaw) return new Response("Missing person", { status: 400 });
+      if (!address && (!lat || !lon)) return new Response("Missing lat/lon or address", { status: 400 });
 
-  const person = PEOPLE[personRaw.toLowerCase()] ?? personRaw;
-  const key = personRaw.toLowerCase();
-  const ts = Math.floor(Date.now() / 1000);
+      const person = PEOPLE[personRaw.toLowerCase()] ?? personRaw;
+      const key = personRaw.toLowerCase();
+      const ts = Math.floor(Date.now() / 1000);
 
-  let mapsLink, placeText;
+      let mapsLink, placeText;
 
-  if (address) {
-    mapsLink = `https://www.google.com/maps?q=${encodeURIComponent(address)}`;
-    placeText = ` (${address})`;
-  } else {
-    mapsLink = `https://www.google.com/maps?q=${lat},${lon}`;
-    const place = await reverseGeocode(env, lat, lon);
-    placeText = place ? ` (${place})` : "";
-  }
+      if (address) {
+        // Address string passed directly (URL-encoded by Shortcut)
+        mapsLink = `https://www.google.com/maps?q=${encodeURIComponent(address)}`;
+        placeText = ` (${address})`;
+      } else {
+        // GPS coords — reverse geocode to get human-readable place name
+        mapsLink = `https://www.google.com/maps?q=${lat},${lon}`;
+        const place = await reverseGeocode(env, lat, lon);
+        placeText = place ? ` (${place})` : "";
+      }
 
-  await env.KV.put(`status_${key}`, JSON.stringify({ type: "location", ts, mapsLink, place: placeText.replace(/[()]/g, "").trim() }));
-  await maybePostLocationIntro(env);
-  await sendMessage(env, LOCATION_CHANNEL_ID, `🌐 ${person} is at this location. ${placeText} ${mapsLink} (@here)`);
-  await updateStatusBoard(env);
-  return new Response("Done!");
-}  
+      await env.KV.put(`status_${key}`, JSON.stringify({ type: "location", ts, mapsLink, place: placeText.replace(/[()]/g, "").trim() }));
+      await maybePostLocationIntro(env);
+      await sendMessage(env, LOCATION_CHANNEL_ID, `🌐 ${person} is here!${placeText} ${mapsLink} (@here)`);
+      await updateStatusBoard(env);
+      return new Response("Done!");
+    }
 
-    // /run — default dishwasher path
+    // --- Default path: /run (dishwasher) ---
+    // Clears any existing empty/done messages, posts running message,
+    // schedules a TimerDO alarm for when the cycle finishes.
     const emptyMsgId = await env.KV.get("empty_msg_id");
     if (emptyMsgId) await deleteMessage(env, CHANNEL_ID, emptyMsgId);
     const doneMsgId = await env.KV.get("done_msg_id");
