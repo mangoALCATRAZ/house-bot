@@ -832,7 +832,7 @@ export default {
 
   await env.KV.put(`status_${key}`, JSON.stringify({ type: "location", ts, mapsLink, place: placeText.replace(/[()]/g, "").trim() }));
   await maybePostLocationIntro(env);
-  await sendMessage(env, LOCATION_CHANNEL_ID, `🌐 ${person} is here!${placeText} ${mapsLink} (@here)`);
+  await sendMessage(env, LOCATION_CHANNEL_ID, `🌐 ${person} is at this location. ${placeText} ${mapsLink} (@here)`);
   await updateStatusBoard(env);
   return new Response("Done!");
 }  
