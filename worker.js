@@ -17,24 +17,14 @@ const CALENDAR_CHANNEL_ID = "1498206238339760158";  // #calendar
 const DEV_CHANNEL_ID = "1497815253311029381";       // #bot-development-spam
 
 // Discord app/API config
-const APP_ID = "1497846686624776363";               // Discord application ID
-const API = "https://discord.com/api/v10";          // Discord REST API base URL
-const TZ = "America/New_York";                      // Timezone for calendar and cull scheduling
-
-// GitHub repo URL included in API docs
+const APP_ID = "1497846686624776363";
+const API = "https://discord.com/api/v10";
+const TZ = "America/New_York";
 const GITHUB_URL = "https://github.com/mangoALCATRAZ/house-bot";
-
-// When true, all messages are redirected to #bot-development-spam.
-// Set per-request via ?dev=1 query param. Also stored in timer params
-// so timed followup messages (e.g. "dishwasher done") also redirect.
-let DEV_MODE = false;
 
 // ---------------------------------------------------------------------------
 // People
 // ---------------------------------------------------------------------------
-// Map of person keys (used in API params) to Discord mention strings.
-// Add new housemates here. Keys are case-insensitive.
-// Example: "peter": "<@123456789>"
 const PEOPLE = {
   "snake": "<@436947323445313536>",
   "floogin": "<@209825795852599297>",
@@ -44,20 +34,24 @@ const PEOPLE = {
 // ---------------------------------------------------------------------------
 // Cull config
 // ---------------------------------------------------------------------------
-// Channels to include in the nightly 3 AM message cull (excludes #calendar)
-const CULL_CHANNELS = [CHANNEL_ID, LAUNDRY_CHANNEL_ID, LOCATION_CHANNEL_ID];
+// Channels included in the hourly cull pass
+const CULL_CHANNELS = [CHANNEL_ID, LOCATION_CHANNEL_ID];
 
-// Age threshold for nightly cull — messages older than this are deleted
+// #laundry-alerts is culled separately with a shorter TTL
+const LAUNDRY_DONE_TTL_MS = 2 * 60 * 60 * 1000;   // 2 hours for done messages
+const LAUNDRY_RUN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days for running/edited messages
+
+// General channel cull age
 const CULL_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-// How long laundry "done" messages persist before being auto-deleted
-const LAUNDRY_DONE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+// CullDO runs every hour to handle laundry cleanup promptly.
+// Nightly 3 AM full cull handles everything else.
+const CULL_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
 // ---------------------------------------------------------------------------
 // Discord API helpers
 // ---------------------------------------------------------------------------
 
-// Returns auth headers for bot API requests
 function botHeaders(env) {
   return {
     "Authorization": `Bot ${env.DISCORD_TOKEN}`,
@@ -65,11 +59,9 @@ function botHeaders(env) {
   };
 }
 
-// Posts a message to a Discord channel.
-// In DEV_MODE, redirects to #bot-development-spam and strips @everyone/@here.
-async function sendMessage(env, channelId, content) {
-  const targetChannel = DEV_MODE ? DEV_CHANNEL_ID : channelId;
-  let finalContent = DEV_MODE
+async function sendMessage(env, channelId, content, devMode = false) {
+  const targetChannel = devMode ? DEV_CHANNEL_ID : channelId;
+  const finalContent = devMode
     ? `[→ <#${channelId}>] ${content.replace(/@everyone/g, "").replace(/@here/g, "").trim()}`
     : content;
   const res = await fetch(`${API}/channels/${targetChannel}/messages`, {
@@ -80,9 +72,8 @@ async function sendMessage(env, channelId, content) {
   return res.json();
 }
 
-// Edits an existing message. Skipped in DEV_MODE.
-async function editMessage(env, channelId, msgId, content) {
-  if (DEV_MODE) return;
+async function editMessage(env, channelId, msgId, content, devMode = false) {
+  if (devMode) return;
   await fetch(`${API}/channels/${channelId}/messages/${msgId}`, {
     method: "PATCH",
     headers: botHeaders(env),
@@ -90,28 +81,24 @@ async function editMessage(env, channelId, msgId, content) {
   });
 }
 
-// Deletes a message. Skipped in DEV_MODE.
-async function deleteMessage(env, channelId, msgId) {
-  if (DEV_MODE) return;
+async function deleteMessage(env, channelId, msgId, devMode = false) {
+  if (devMode) return;
   await fetch(`${API}/channels/${channelId}/messages/${msgId}`, {
     method: "DELETE",
     headers: botHeaders(env),
   });
 }
 
-// Pins a message to a channel. Skipped in DEV_MODE.
-async function pinMessage(env, channelId, msgId) {
-  if (DEV_MODE) return;
+async function pinMessage(env, channelId, msgId, devMode = false) {
+  if (devMode) return;
   await fetch(`${API}/channels/${channelId}/pins/${msgId}`, {
     method: "PUT",
     headers: botHeaders(env),
   });
 }
 
-// Renames a channel with an emoji prefix, e.g. "🔴dishwasher-alerts".
-// Handles rate limiting with a single retry. Skipped in DEV_MODE.
-async function setChannelName(env, channelId, emoji, baseName) {
-  if (DEV_MODE) return;
+async function setChannelName(env, channelId, emoji, baseName, devMode = false) {
+  if (devMode) return;
   const res = await fetch(`${API}/channels/${channelId}`, {
     method: "PATCH",
     headers: botHeaders(env),
@@ -133,9 +120,6 @@ async function setChannelName(env, channelId, emoji, baseName) {
 // Google Maps
 // ---------------------------------------------------------------------------
 
-// Converts GPS coordinates to a human-readable address using the
-// Google Maps Geocoding API. Prefers named establishments over street addresses.
-// Returns null if geocoding fails or no results are found.
 async function reverseGeocode(env, lat, lon) {
   const res = await fetch(
     `https://maps.googleapis.com/maps/api/geocode/json?latlng=${lat},${lon}&key=${env.GOOGLE_MAPS_KEY}`
@@ -155,8 +139,6 @@ async function reverseGeocode(env, lat, lon) {
 // Cull helpers
 // ---------------------------------------------------------------------------
 
-// Calculates the UTC timestamp for the next 3 AM EST/EDT occurrence.
-// Used by CullDO to schedule its nightly alarm.
 function getNext3AMEST() {
   const now = new Date();
   const estNow = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
@@ -169,8 +151,6 @@ function getNext3AMEST() {
   return next3AM.getTime() + tzOffset;
 }
 
-// Fetches all pinned message IDs for a channel.
-// Used by cullChannel to avoid deleting pinned intro/status messages.
 async function getPinnedIds(env, channelId) {
   const res = await fetch(`${API}/channels/${channelId}/pins`, {
     headers: botHeaders(env),
@@ -179,12 +159,10 @@ async function getPinnedIds(env, channelId) {
   return Array.isArray(pins) ? pins.map(p => p.id) : [];
 }
 
-// Deletes all non-pinned messages older than CULL_AGE_MS from a channel.
-// Paginates through messages in batches of 100, stopping when all remaining
-// messages are newer than the cutoff. Rate-limited to 500ms between deletes.
-async function cullChannel(env, channelId) {
+// Culls non-pinned messages older than cutoffMs from a channel.
+async function cullChannel(env, channelId, cutoffMs) {
   const pinnedIds = await getPinnedIds(env, channelId);
-  const cutoff = Date.now() - CULL_AGE_MS;
+  const cutoff = Date.now() - cutoffMs;
   let lastId = null;
   let culled = 0;
 
@@ -199,7 +177,6 @@ async function cullChannel(env, channelId) {
     if (!Array.isArray(messages) || messages.length === 0) break;
 
     for (const msg of messages) {
-      // Extract timestamp from Discord snowflake ID
       const msgTs = Number(BigInt(msg.id) >> 22n) + 1420070400000;
       if (msgTs > cutoff) {
         lastId = msg.id;
@@ -227,9 +204,6 @@ async function cullChannel(env, channelId) {
 // Discord interaction signature verification
 // ---------------------------------------------------------------------------
 
-// Verifies that an incoming /interactions POST request is genuinely from Discord
-// using Ed25519 signature verification. Returns the raw body string if valid,
-// false if invalid. Required by Discord for all interaction endpoints.
 async function verifyDiscordSignature(request, env) {
   const signature = request.headers.get("x-signature-ed25519");
   const timestamp = request.headers.get("x-signature-timestamp");
@@ -252,7 +226,6 @@ async function verifyDiscordSignature(request, env) {
   return valid ? body : false;
 }
 
-// Converts a hex string to a Uint8Array, used for Ed25519 key/signature parsing.
 function hexToBytes(hex) {
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) {
@@ -265,29 +238,23 @@ function hexToBytes(hex) {
 // Calendar helpers
 // ---------------------------------------------------------------------------
 
-// Parses a date (YYYY-MM-DD) and time (HH:MM) string in EST/EDT
-// and returns a UTC Date object.
 function parseEventTime(date, time) {
-  const localDate = new Date(`${date}T${time}:00`);
-  const tzOffset =
-    new Date(localDate.toLocaleString("en-US", { timeZone: "UTC" })) -
-    new Date(localDate.toLocaleString("en-US", { timeZone: TZ }));
-  return new Date(localDate.getTime() + tzOffset);
+  const naive = new Date(`${date}T${time}:00`);
+  const utcStr = naive.toLocaleString("en-US", { timeZone: "UTC" });
+  const estStr = naive.toLocaleString("en-US", { timeZone: TZ });
+  const tzOffset = new Date(utcStr) - new Date(estStr);
+  return new Date(naive.getTime() + tzOffset);
 }
 
-// Retrieves the calendar event list from KV. Returns [] if none exist.
 async function getEvents(env) {
   const raw = await env.KV.get("calendar_events");
   return raw ? JSON.parse(raw) : [];
 }
 
-// Saves the calendar event list to KV.
 async function saveEvents(env, events) {
   await env.KV.put("calendar_events", JSON.stringify(events));
 }
 
-// Removes events whose timestamp has passed and saves the updated list.
-// Returns the list of upcoming (non-expired) events.
 async function pruneExpiredEvents(env) {
   const events = await getEvents(env);
   const now = Date.now();
@@ -296,8 +263,6 @@ async function pruneExpiredEvents(env) {
   return upcoming;
 }
 
-// Builds the pinned calendar board message content showing all upcoming events,
-// sorted by date. Shows event title, timestamp, reminder, and ID.
 async function buildCalendarBoard(env) {
   const events = await pruneExpiredEvents(env);
   const lines = ["📅 **Upcoming Events**", "​"];
@@ -319,20 +284,17 @@ async function buildCalendarBoard(env) {
   return lines.join("\n");
 }
 
-// Edits the pinned calendar board message with the latest event list.
-async function updateCalendarBoard(env) {
+async function updateCalendarBoard(env, devMode = false) {
   const calMsgId = await env.KV.get("calendar_msg_id");
   const content = await buildCalendarBoard(env);
-  if (calMsgId) await editMessage(env, CALENDAR_CHANNEL_ID, calMsgId, content);
+  if (calMsgId) await editMessage(env, CALENDAR_CHANNEL_ID, calMsgId, content, devMode);
 }
 
 // ---------------------------------------------------------------------------
 // Slash command handlers
 // ---------------------------------------------------------------------------
 
-// Handles /event — validates input, stores event in KV, schedules reminder
-// and expiry timers, updates the calendar board, and posts a confirmation.
-async function handleEventCommand(env, options) {
+async function handleEventCommand(env, options, devMode) {
   const title = options.find(o => o.name === "title")?.value;
   const date = options.find(o => o.name === "date")?.value;
   const time = options.find(o => o.name === "time")?.value;
@@ -351,32 +313,28 @@ async function handleEventCommand(env, options) {
 
   if (eventTs <= now) return "❌ Event date is in the past.";
 
-  await maybePostCalendarIntro(env);
+  await maybePostCalendarIntro(env, devMode);
 
   const id = `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
   const events = await getEvents(env);
   events.push({ id, title, ts: eventTs, reminder });
   await saveEvents(env, events);
 
-  // Schedule reminder (fires X minutes before the event)
   const reminderDelay = eventTs - now - reminder * 60 * 1000;
   if (reminderDelay > 0) {
     await scheduleTimer(env, "event_reminder", reminderDelay, {
-      eventId: id, eventTitle: title, eventTs,
+      eventId: id, eventTitle: title, eventTs, devMode,
     });
   }
 
-  // Schedule expiry cleanup (fires 1 minute after event time)
-  await scheduleTimer(env, "event_expire", eventTs - now + 60000, { eventId: id });
-  await updateCalendarBoard(env);
-  await sendMessage(env, CALENDAR_CHANNEL_ID, `@here 📅 New event added: **${title}** — <t:${Math.floor(eventTs / 1000)}:F> 🔔 Reminder ${reminder} min before. 🆔 \`${id}\``);
+  await scheduleTimer(env, "event_expire", eventTs - now + 60000, { eventId: id, devMode });
+  await updateCalendarBoard(env, devMode);
+  await sendMessage(env, CALENDAR_CHANNEL_ID, `@here 📅 New event added: **${title}** — <t:${Math.floor(eventTs / 1000)}:F> 🔔 Reminder ${reminder} min before. 🆔 \`${id}\``, devMode);
 
   return `✅ Event **${title}** added for <t:${Math.floor(eventTs / 1000)}:F>! ID: \`${id}\``;
 }
 
-// Handles /cancel — removes an event from KV by ID, updates the board,
-// and posts a cancellation notice to #calendar.
-async function handleCancelCommand(env, options) {
+async function handleCancelCommand(env, options, devMode) {
   const id = options.find(o => o.name === "id")?.value;
   if (!id) return "❌ Missing event ID.";
 
@@ -386,14 +344,12 @@ async function handleCancelCommand(env, options) {
 
   const [removed] = events.splice(idx, 1);
   await saveEvents(env, events);
-  await updateCalendarBoard(env);
-  await sendMessage(env, CALENDAR_CHANNEL_ID, `@here ❌ Event cancelled: **${removed.title}** (<t:${Math.floor(removed.ts / 1000)}:F>)`);
+  await updateCalendarBoard(env, devMode);
+  await sendMessage(env, CALENDAR_CHANNEL_ID, `@here ❌ Event cancelled: **${removed.title}** (<t:${Math.floor(removed.ts / 1000)}:F>)`, devMode);
 
   return `✅ Event **${removed.title}** cancelled.`;
 }
 
-// Handles /events — returns a formatted list of upcoming events as an
-// ephemeral-style reply (only visible to the user who ran the command).
 async function handleEventsCommand(env) {
   const events = await pruneExpiredEvents(env);
   if (events.length === 0) return "📅 No upcoming events.";
@@ -408,11 +364,9 @@ async function handleEventsCommand(env) {
 }
 
 // ---------------------------------------------------------------------------
-// Status board (#leave-arrival-alerts)
+// Status board
 // ---------------------------------------------------------------------------
 
-// Builds the pinned status board message content showing the current
-// location/status of all people in PEOPLE. Shows home, out, or last seen.
 async function buildStatusBoard(env) {
   const lines = ["📊 **Current Status**"];
   for (const key of Object.keys(PEOPLE)) {
@@ -438,21 +392,19 @@ async function buildStatusBoard(env) {
   return lines.join("\n");
 }
 
-// Edits the pinned status board message with the latest status for all people.
-async function updateStatusBoard(env) {
+async function updateStatusBoard(env, devMode = false) {
   const statusMsgId = await env.KV.get("status_msg_id");
   const content = await buildStatusBoard(env);
-  if (statusMsgId) await editMessage(env, LOCATION_CHANNEL_ID, statusMsgId, content);
+  if (statusMsgId) await editMessage(env, LOCATION_CHANNEL_ID, statusMsgId, content, devMode);
 }
 
 // ---------------------------------------------------------------------------
 // Channel intro posts
-// All maybePost* functions check if the channel is empty before posting.
-// They are idempotent — safe to call on every request.
 // ---------------------------------------------------------------------------
 
-// Posts the #general intro message and pins it. Only fires if #general is empty.
-async function maybePostGeneral(env) {
+async function maybePostGeneral(env, devMode) {
+  const posted = await env.KV.get("general_intro_posted");
+  if (posted) return;
   const res = await fetch(`${API}/channels/${GENERAL_CHANNEL_ID}/messages?limit=1`, {
     headers: botHeaders(env),
   });
@@ -469,121 +421,15 @@ async function maybePostGeneral(env) {
       "📖 **#bot-api-documentation** — Full API docs for triggering the bot via Shortcuts or NFC tags.",
       "​",
       "​",
-    ].join("\n"));
-    await pinMessage(env, GENERAL_CHANNEL_ID, data.id);
+    ].join("\n"), devMode);
+    await pinMessage(env, GENERAL_CHANNEL_ID, data.id, devMode);
+    await env.KV.put("general_intro_posted", "1");
   }
 }
 
-// Posts the #dishwasher-alerts intro and pins it. Only fires if channel is empty.
-async function maybePostIntro(env) {
-  const res = await fetch(`${API}/channels/${CHANNEL_ID}/messages?limit=1`, {
-    headers: botHeaders(env),
-  });
-  const messages = await res.json();
-  if (messages.length === 0) {
-    const data = await sendMessage(env, CHANNEL_ID, [
-      "👋 **Welcome to #dishwasher-alerts!**",
-      "This channel is automatically updated by a bot to track the state of the dishwasher. The bot is triggered via a Shortcut or NFC tag on the dishwasher itself.",
-      "​",
-      "**Status guide:**",
-      "🔴 **Running** — The dishwasher is currently running. Don't open it!",
-      "🏁 **Done** — The dishwasher has finished. Please unload it when you get a chance.",
-      "🟩 **Empty** — The dishwasher is empty and ready to be loaded.",
-      "​",
-      "​",
-    ].join("\n"));
-    await pinMessage(env, CHANNEL_ID, data.id);
-  }
-}
-
-// Posts the #leave-arrival-alerts intro and pins it, then posts and pins
-// the initial status board. Only fires if channel is empty.
-async function maybePostLocationIntro(env) {
-  const res = await fetch(`${API}/channels/${LOCATION_CHANNEL_ID}/messages?limit=1`, {
-    headers: botHeaders(env),
-  });
-  const messages = await res.json();
-  if (messages.length === 0) {
-    const intro = await sendMessage(env, LOCATION_CHANNEL_ID, [
-      "👋 **Welcome to #leave-arrival-alerts!**",
-      "This channel is automatically updated by a bot to track who is home. It is triggered by a Shortcut that detects when someone leaves or arrives at the house via geolocation.",
-      "​",
-      "**Status guide:**",
-      "🏠 **Arrived** — Someone has arrived home.",
-      "🚶 **Left** — Someone has left home.",
-      "🌐 **Location** — A live location ping with a Google Maps link.",
-      "​",
-      "​",
-    ].join("\n"));
-    await pinMessage(env, LOCATION_CHANNEL_ID, intro.id);
-
-    const statusContent = await buildStatusBoard(env);
-    const statusMsg = await sendMessage(env, LOCATION_CHANNEL_ID, statusContent);
-    await pinMessage(env, LOCATION_CHANNEL_ID, statusMsg.id);
-    await env.KV.put("status_msg_id", statusMsg.id);
-  }
-}
-
-// Posts the #laundry-alerts intro and pins it. Only fires if channel is empty.
-async function maybePostLaundryIntro(env) {
-  const res = await fetch(`${API}/channels/${LAUNDRY_CHANNEL_ID}/messages?limit=1`, {
-    headers: botHeaders(env),
-  });
-  const messages = await res.json();
-  if (messages.length === 0) {
-    const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, [
-      "👋 **Welcome to #laundry-alerts!**",
-      "This channel is automatically updated by a bot to track the state of the washer and dryer. The bot is triggered via a Shortcut or NFC tag on the appliances.",
-      "​",
-      "**Status guide:**",
-      "🫧 **Washer Running** — The washer is currently running.",
-      "⚠️ **Washer Done** — The washer is done! Move it to the dryer.",
-      "🌀 **Dryer Running** — The dryer is currently running.",
-      "✅ **Dryer Done** — The dryer is done! Ready to fold.",
-      "​",
-      "​",
-    ].join("\n"));
-    await pinMessage(env, LAUNDRY_CHANNEL_ID, data.id);
-  }
-}
-
-// Posts the #calendar intro and pins it. Also ensures the pinned calendar
-// board exists — creates and pins it if calendar_msg_id is not in KV.
-// The board check runs even if the intro has already been posted.
-async function maybePostCalendarIntro(env) {
-  const res = await fetch(`${API}/channels/${CALENDAR_CHANNEL_ID}/messages?limit=1`, {
-    headers: botHeaders(env),
-  });
-  const messages = await res.json();
-  if (messages.length === 0) {
-    const intro = await sendMessage(env, CALENDAR_CHANNEL_ID, [
-      "👋 **Welcome to #calendar!**",
-      "This is the shared house calendar. Use slash commands to manage events:",
-      "​",
-      "📌 `/event title:Dentist date:2026-05-01 time:14:00 reminder:30` — Add an event",
-      "❌ `/cancel id:evt_abc123` — Cancel an event by ID",
-      "📋 `/events` — List all upcoming events",
-      "​",
-      "All times are in EST. Event IDs are shown in the calendar below.",
-      "​",
-      "​",
-    ].join("\n"));
-    await pinMessage(env, CALENDAR_CHANNEL_ID, intro.id);
-  }
-
-  // Always ensure the pinned calendar board exists, even if intro was already posted
-  const calMsgId = await env.KV.get("calendar_msg_id");
-  if (!calMsgId) {
-    const calContent = await buildCalendarBoard(env);
-    const calMsg = await sendMessage(env, CALENDAR_CHANNEL_ID, calContent);
-    await pinMessage(env, CALENDAR_CHANNEL_ID, calMsg.id);
-    await env.KV.put("calendar_msg_id", calMsg.id);
-  }
-}
-
-// Posts the #bot-api-documentation message and pins it.
-// Only fires if the channel is empty.
-async function maybePostDocs(env) {
+async function maybePostDocs(env, devMode) {
+  const posted = await env.KV.get("docs_intro_posted");
+  if (posted) return;
   const res = await fetch(`${API}/channels/${DOCS_CHANNEL_ID}/messages?limit=1`, {
     headers: botHeaders(env),
   });
@@ -663,14 +509,126 @@ async function maybePostDocs(env) {
       "---",
       "",
       "## 🧹 Auto-Cleanup",
-      "Alert channels are cleaned up every night at **3 AM EST**. Messages older than 7 days are deleted. Pinned messages are always preserved. #calendar is never culled.",
-      "Laundry done messages are automatically deleted after **2 hours**.",
+      "Alert channels are cleaned up every hour. Laundry done messages are deleted after **2 hours**. All other alert messages are deleted after **7 days**. Pinned messages are always preserved. #calendar is never culled.",
       "",
       "---",
       "",
       `📖 Full documentation and source code: <${GITHUB_URL}>`,
-    ].join("\n"));
-    await pinMessage(env, DOCS_CHANNEL_ID, data.id);
+    ].join("\n"), devMode);
+    await pinMessage(env, DOCS_CHANNEL_ID, data.id, devMode);
+    await env.KV.put("docs_intro_posted", "1");
+  }
+}
+
+async function maybePostIntro(env, devMode) {
+  const posted = await env.KV.get("dishwasher_intro_posted");
+  if (posted) return;
+  const res = await fetch(`${API}/channels/${CHANNEL_ID}/messages?limit=1`, {
+    headers: botHeaders(env),
+  });
+  const messages = await res.json();
+  if (messages.length === 0) {
+    const data = await sendMessage(env, CHANNEL_ID, [
+      "👋 **Welcome to #dishwasher-alerts!**",
+      "This channel is automatically updated by a bot to track the state of the dishwasher. The bot is triggered via a Shortcut or NFC tag on the dishwasher itself.",
+      "​",
+      "**Status guide:**",
+      "🔴 **Running** — The dishwasher is currently running. Don't open it!",
+      "🏁 **Done** — The dishwasher has finished. Please unload it when you get a chance.",
+      "🟩 **Empty** — The dishwasher is empty and ready to be loaded.",
+      "​",
+      "​",
+    ].join("\n"), devMode);
+    await pinMessage(env, CHANNEL_ID, data.id, devMode);
+    await env.KV.put("dishwasher_intro_posted", "1");
+  }
+}
+
+async function maybePostLocationIntro(env, devMode) {
+  const posted = await env.KV.get("location_intro_posted");
+  if (posted) return;
+  const res = await fetch(`${API}/channels/${LOCATION_CHANNEL_ID}/messages?limit=1`, {
+    headers: botHeaders(env),
+  });
+  const messages = await res.json();
+  if (messages.length === 0) {
+    const intro = await sendMessage(env, LOCATION_CHANNEL_ID, [
+      "👋 **Welcome to #leave-arrival-alerts!**",
+      "This channel is automatically updated by a bot to track who is home. It is triggered by a Shortcut that detects when someone leaves or arrives at the house via geolocation.",
+      "​",
+      "**Status guide:**",
+      "🏠 **Arrived** — Someone has arrived home.",
+      "🚶 **Left** — Someone has left home.",
+      "🌐 **Location** — A live location ping with a Google Maps link.",
+      "​",
+      "​",
+    ].join("\n"), devMode);
+    await pinMessage(env, LOCATION_CHANNEL_ID, intro.id, devMode);
+
+    const statusContent = await buildStatusBoard(env);
+    const statusMsg = await sendMessage(env, LOCATION_CHANNEL_ID, statusContent, devMode);
+    await pinMessage(env, LOCATION_CHANNEL_ID, statusMsg.id, devMode);
+    await env.KV.put("status_msg_id", statusMsg.id);
+    await env.KV.put("location_intro_posted", "1");
+  }
+}
+
+async function maybePostLaundryIntro(env, devMode) {
+  const posted = await env.KV.get("laundry_intro_posted");
+  if (posted) return;
+  const res = await fetch(`${API}/channels/${LAUNDRY_CHANNEL_ID}/messages?limit=1`, {
+    headers: botHeaders(env),
+  });
+  const messages = await res.json();
+  if (messages.length === 0) {
+    const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, [
+      "👋 **Welcome to #laundry-alerts!**",
+      "This channel is automatically updated by a bot to track the state of the washer and dryer. The bot is triggered via a Shortcut or NFC tag on the appliances.",
+      "​",
+      "**Status guide:**",
+      "🫧 **Washer Running** — The washer is currently running.",
+      "⚠️ **Washer Done** — The washer is done! Move it to the dryer.",
+      "🌀 **Dryer Running** — The dryer is currently running.",
+      "✅ **Dryer Done** — The dryer is done! Ready to fold.",
+      "​",
+      "​",
+    ].join("\n"), devMode);
+    await pinMessage(env, LAUNDRY_CHANNEL_ID, data.id, devMode);
+    await env.KV.put("laundry_intro_posted", "1");
+  }
+}
+
+async function maybePostCalendarIntro(env, devMode) {
+  const posted = await env.KV.get("calendar_intro_posted");
+  if (!posted) {
+    const res = await fetch(`${API}/channels/${CALENDAR_CHANNEL_ID}/messages?limit=1`, {
+      headers: botHeaders(env),
+    });
+    const messages = await res.json();
+    if (messages.length === 0) {
+      const intro = await sendMessage(env, CALENDAR_CHANNEL_ID, [
+        "👋 **Welcome to #calendar!**",
+        "This is the shared house calendar. Use slash commands to manage events:",
+        "​",
+        "📌 `/event title:Dentist date:2026-05-01 time:14:00 reminder:30` — Add an event",
+        "❌ `/cancel id:evt_abc123` — Cancel an event by ID",
+        "📋 `/events` — List all upcoming events",
+        "​",
+        "All times are in EST. Event IDs are shown in the calendar below.",
+        "​",
+        "​",
+      ].join("\n"), devMode);
+      await pinMessage(env, CALENDAR_CHANNEL_ID, intro.id, devMode);
+      await env.KV.put("calendar_intro_posted", "1");
+    }
+  }
+
+  const calMsgId = await env.KV.get("calendar_msg_id");
+  if (!calMsgId) {
+    const calContent = await buildCalendarBoard(env);
+    const calMsg = await sendMessage(env, CALENDAR_CHANNEL_ID, calContent, devMode);
+    await pinMessage(env, CALENDAR_CHANNEL_ID, calMsg.id, devMode);
+    await env.KV.put("calendar_msg_id", calMsg.id);
   }
 }
 
@@ -678,9 +636,9 @@ async function maybePostDocs(env) {
 // Durable Objects
 // ---------------------------------------------------------------------------
 
-// CullDO — runs once daily at 3 AM EST to delete old messages.
-// Started once via maybeStartCuller() on first API invocation.
-// Reschedules itself after each run.
+// CullDO — runs every hour.
+// - Every run: culls #laundry-alerts done messages older than 2 hours
+// - At 3 AM EST only: full 7-day cull of all alert channels
 export class CullDO extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -688,38 +646,52 @@ export class CullDO extends DurableObject {
     this.env = env;
   }
 
-  // Called once to schedule the first alarm
   async fetch(request) {
-    const next3AM = getNext3AMEST();
-    await this.ctx.storage.setAlarm(next3AM);
+    // Schedule first run in 1 hour
+    await this.ctx.storage.setAlarm(Date.now() + CULL_INTERVAL_MS);
     return new Response("Culler scheduled");
   }
 
-  // Runs at 3 AM EST, culls all CULL_CHANNELS, reschedules for next day
   async alarm() {
     const env = this.env;
-    console.log("Running daily cull at 3 AM EST");
+    const now = new Date();
+    const estNow = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
+    const hour = estNow.getHours();
 
-    for (const channelId of CULL_CHANNELS) {
+    // Always cull laundry done messages older than 2 hours
+    try {
+      const culled = await cullChannel(env, LAUNDRY_CHANNEL_ID, LAUNDRY_DONE_TTL_MS);
+      console.log(`Hourly laundry cull: removed ${culled} messages`);
+    } catch (e) {
+      console.error("Laundry cull failed:", e);
+    }
+
+    // Full 7-day cull of all channels at 3 AM EST
+    if (hour === 3) {
+      console.log("Running full nightly cull at 3 AM EST");
+      for (const channelId of CULL_CHANNELS) {
+        try {
+          const culled = await cullChannel(env, channelId, CULL_AGE_MS);
+          console.log(`Nightly cull: removed ${culled} messages from ${channelId}`);
+        } catch (e) {
+          console.error(`Nightly cull failed for ${channelId}:`, e);
+        }
+      }
+      // Also run 7-day cull on laundry (catches running/edited messages)
       try {
-        const culled = await cullChannel(env, channelId);
-        console.log(`Culled ${culled} messages from ${channelId}`);
+        await cullChannel(env, LAUNDRY_CHANNEL_ID, LAUNDRY_RUN_TTL_MS);
       } catch (e) {
-        console.error(`Failed to cull ${channelId}:`, e);
+        console.error("Nightly laundry cull failed:", e);
       }
     }
 
-    const next3AM = getNext3AMEST();
-    await this.ctx.storage.setAlarm(next3AM);
+    // Reschedule for next hour
+    await this.ctx.storage.setAlarm(Date.now() + CULL_INTERVAL_MS);
   }
 }
 
-// TimerDO — general-purpose timed alarm for all delayed actions:
-// - dishwasher/washer/dryer done notifications
-// - laundry done message auto-delete (after LAUNDRY_DONE_TTL_MS)
-// - calendar event reminders
-// - calendar event expiry cleanup
-// Each timer is a separate DO instance with its own storage and alarm.
+// TimerDO — general-purpose timed alarm for delayed actions.
+// Each timer is a separate DO instance with its own storage.
 export class TimerDO extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -727,7 +699,6 @@ export class TimerDO extends DurableObject {
     this.env = env;
   }
 
-  // Stores params and sets the alarm for delayMs milliseconds from now
   async fetch(request) {
     const params = await request.json();
     await this.ctx.storage.put("params", params);
@@ -735,79 +706,58 @@ export class TimerDO extends DurableObject {
     return new Response("OK");
   }
 
-  // Fires when the alarm triggers. Restores DEV_MODE from stored params
-  // so dev-mode timed messages also route to #bot-development-spam.
   async alarm() {
     const params = await this.ctx.storage.get("params");
     if (!params) return;
 
-    DEV_MODE = params.devMode ?? false;
-
-    const { type, msgid, startTs, eventId, eventTitle, eventTs } = params;
+    const { type, msgid, startTs, eventId, eventTitle, eventTs, devMode = false } = params;
     const env = this.env;
 
     if (type === "dishwasher") {
-      // Edit the running message to show when it ran, then post done alert
-      await editMessage(env, CHANNEL_ID, msgid, `🫧 The dishwasher was run at <t:${startTs}:F>.`);
-      const data = await sendMessage(env, CHANNEL_ID, `@everyone 🏁 The dishwasher is DONE! Ready to unload!`);
+      await editMessage(env, CHANNEL_ID, msgid, `🫧 The dishwasher was run at <t:${startTs}:F>.`, devMode);
+      const data = await sendMessage(env, CHANNEL_ID, `@everyone 🏁 The dishwasher is DONE! Ready to unload!`, devMode);
       await env.KV.put("done_msg_id", data.id);
-      await setChannelName(env, CHANNEL_ID, "🏁", "dishwasher-alerts");
+      await setChannelName(env, CHANNEL_ID, "🏁", "dishwasher-alerts", devMode);
+
     } else if (type === "washer") {
-      // Edit the running message, post done alert, schedule auto-delete in 2hrs
-      await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🫧 The washer was run at <t:${startTs}:F>.`);
-      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ⚠️ The washer is DONE! Move it to the dryer.`);
-      await env.KV.put(`washer_done_msg_${msgid}`, data.id);
-      await setChannelName(env, LAUNDRY_CHANNEL_ID, "⚠️", "laundry-alerts");
-      await scheduleTimer(env, "delete_msg", LAUNDRY_DONE_TTL_MS, {
-        channelId: LAUNDRY_CHANNEL_ID,
-        deleteTargetMsgId: data.id,
-      });
+      await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🫧 The washer was run at <t:${startTs}:F>.`, devMode);
+      await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ⚠️ The washer is DONE! Move it to the dryer.`, devMode);
+      await setChannelName(env, LAUNDRY_CHANNEL_ID, "⚠️", "laundry-alerts", devMode);
+      // Cleanup handled by CullDO hourly pass — no need to schedule here
+
     } else if (type === "dryer") {
-      // Edit the running message, post done alert, schedule auto-delete in 2hrs
-      await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🌀 The dryer was run at <t:${startTs}:F>.`);
-      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ✅ The dryer is DONE! Ready to fold.`);
-      await env.KV.put(`dryer_done_msg_${msgid}`, data.id);
-      await setChannelName(env, LAUNDRY_CHANNEL_ID, "✅", "laundry-alerts");
-      await scheduleTimer(env, "delete_msg", LAUNDRY_DONE_TTL_MS, {
-        channelId: LAUNDRY_CHANNEL_ID,
-        deleteTargetMsgId: data.id,
-      });
-    } else if (type === "delete_msg") {
-      // Deletes a specific message — used for laundry done auto-cleanup
-      await fetch(`${API}/channels/${params.channelId}/messages/${params.deleteTargetMsgId}`, {
-        method: "DELETE",
-        headers: botHeaders(env),
-      });
+      await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🌀 The dryer was run at <t:${startTs}:F>.`, devMode);
+      await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ✅ The dryer is DONE! Ready to fold.`, devMode);
+      await setChannelName(env, LAUNDRY_CHANNEL_ID, "✅", "laundry-alerts", devMode);
+      // Cleanup handled by CullDO hourly pass — no need to schedule here
+
     } else if (type === "event_reminder") {
-      // Posts a reminder to #calendar if the event still exists (wasn't cancelled)
       const events = await getEvents(env);
       const event = events.find(e => e.id === eventId);
       if (event) {
-        await sendMessage(env, CALENDAR_CHANNEL_ID, `@everyone 🔔 Reminder: **${eventTitle}** is starting <t:${Math.floor(eventTs / 1000)}:R>!`);
+        await sendMessage(env, CALENDAR_CHANNEL_ID, `@everyone 🔔 Reminder: **${eventTitle}** is starting <t:${Math.floor(eventTs / 1000)}:R>!`, devMode);
       }
+
     } else if (type === "event_expire") {
-      // Prunes expired events from KV and updates the calendar board
       await pruneExpiredEvents(env);
-      await updateCalendarBoard(env);
+      await updateCalendarBoard(env, devMode);
     }
 
     await this.ctx.storage.delete("params");
   }
 }
 
-// Creates a new TimerDO instance and schedules it to fire after delayMs.
-// extras are merged into the stored params and available in the alarm handler.
 async function scheduleTimer(env, type, delayMs, extras = {}) {
   const id = env.TIMER.newUniqueId();
   const stub = env.TIMER.get(id);
   await stub.fetch("https://internal/set", {
     method: "POST",
-    body: JSON.stringify({ type, delayMs, devMode: DEV_MODE, ...extras }),
+    body: JSON.stringify({ type, delayMs, ...extras }),
   });
 }
 
-// Starts the CullDO on first API invocation. Uses KV flag "culler_started"
-// to ensure it's only initialized once across all worker instances.
+// Starts the CullDO on first API invocation.
+// Uses KV flag to ensure it only initializes once.
 async function maybeStartCuller(env) {
   const started = await env.KV.get("culler_started");
   if (!started) {
@@ -815,7 +765,7 @@ async function maybeStartCuller(env) {
     const stub = env.CULLER.get(id);
     await stub.fetch("https://internal/start", { method: "POST" });
     await env.KV.put("culler_started", "1");
-    console.log("Culler started, first run at next 3 AM EST");
+    console.log("Culler started, running hourly");
   }
 }
 
@@ -827,47 +777,36 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // ---------------------------------------------------------------------------
-    // Discord interactions endpoint (/interactions)
-    // Handles slash commands from Discord. Must respond within 3 seconds,
-    // so we return a deferred response (type 5) immediately and do work
-    // async via ctx.waitUntil(), then edit the response via webhook.
-    // ---------------------------------------------------------------------------
+    // Discord interactions endpoint
     if (path === "/interactions") {
       const bodyText = await verifyDiscordSignature(request, env);
       if (!bodyText) return new Response("Unauthorized", { status: 401 });
 
       const interaction = JSON.parse(bodyText);
 
-      // Type 1 = Discord ping verification (required during setup)
-      if (interaction.type === 1) {
-        return Response.json({ type: 1 });
-      }
+      if (interaction.type === 1) return Response.json({ type: 1 });
 
-      // Type 2 = slash command
       if (interaction.type === 2) {
         const { name, options = [] } = interaction.data;
         const token = interaction.token;
 
-        // Respond immediately with "thinking..." to avoid 3s timeout
         const response = new Response(JSON.stringify({ type: 5 }), {
           headers: { "Content-Type": "application/json" },
         });
 
-        // Do actual work after responding, keeping worker alive with waitUntil
         ctx.waitUntil((async () => {
+          const devMode = false;
           let reply;
           if (name === "event") {
-            reply = await handleEventCommand(env, options);
+            reply = await handleEventCommand(env, options, devMode);
           } else if (name === "cancel") {
-            reply = await handleCancelCommand(env, options);
+            reply = await handleCancelCommand(env, options, devMode);
           } else if (name === "events") {
             reply = await handleEventsCommand(env);
           } else {
             reply = "Unknown command.";
           }
 
-          // Edit the deferred "thinking..." message with the actual reply
           await fetch(`${API}/webhooks/${APP_ID}/${token}/messages/@original`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
@@ -881,55 +820,49 @@ export default {
       return Response.json({ type: 1 });
     }
 
-    // ---------------------------------------------------------------------------
-    // HTTP API endpoints — all require ?token=TOKEN
-    // ---------------------------------------------------------------------------
+    // All other endpoints require token
     if (url.searchParams.get("token") !== TOKEN) {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    // Set dev mode for this request (persists into timer params for followups)
-    DEV_MODE = url.searchParams.get("dev") === "1";
+    const devMode = url.searchParams.get("dev") === "1";
 
-    // Run on every request — idempotent, only posts if channels are empty
-    await maybePostDocs(env);
-    await maybePostGeneral(env);
+    await maybePostDocs(env, devMode);
+    await maybePostGeneral(env, devMode);
     await maybeStartCuller(env);
 
     // --- Dishwasher ---
 
     if (path === "/unloaded") {
       const doneMsgId = await env.KV.get("done_msg_id");
-      if (doneMsgId) await deleteMessage(env, CHANNEL_ID, doneMsgId);
-      const data = await sendMessage(env, CHANNEL_ID, `@everyone 🟩 The dishwasher is empty and ready to be loaded!`);
+      if (doneMsgId) await deleteMessage(env, CHANNEL_ID, doneMsgId, devMode);
+      const data = await sendMessage(env, CHANNEL_ID, `@everyone 🟩 The dishwasher is empty and ready to be loaded!`, devMode);
       await env.KV.put("empty_msg_id", data.id);
-      await setChannelName(env, CHANNEL_ID, "🟩", "dishwasher-alerts");
+      await setChannelName(env, CHANNEL_ID, "🟩", "dishwasher-alerts", devMode);
       return new Response("Done!");
     }
 
     // --- Laundry ---
-    // Note: washer and dryer are fully independent — starting one does not
-    // affect the other's timer or messages. Concurrent loads are supported.
 
     if (path === "/washer") {
-      await maybePostLaundryIntro(env);
+      await maybePostLaundryIntro(env, devMode);
       const minutes = parseInt(url.searchParams.get("minutes") || "45");
       const startTs = Math.floor(Date.now() / 1000);
       const future = startTs + minutes * 60;
-      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone 🫧 The washer is RUNNING. It will be done <t:${future}:R>`);
-      await setChannelName(env, LAUNDRY_CHANNEL_ID, "🫧", "laundry-alerts");
-      await scheduleTimer(env, "washer", minutes * 60 * 1000, { msgid: data.id, startTs });
+      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone 🫧 The washer is RUNNING. It will be done <t:${future}:R>`, devMode);
+      await setChannelName(env, LAUNDRY_CHANNEL_ID, "🫧", "laundry-alerts", devMode);
+      await scheduleTimer(env, "washer", minutes * 60 * 1000, { msgid: data.id, startTs, devMode });
       return new Response("Started!");
     }
 
     if (path === "/dryer") {
-      await maybePostLaundryIntro(env);
+      await maybePostLaundryIntro(env, devMode);
       const minutes = parseInt(url.searchParams.get("minutes") || "45");
       const startTs = Math.floor(Date.now() / 1000);
       const future = startTs + minutes * 60;
-      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone 🌀 The dryer is RUNNING. It will be done <t:${future}:R>`);
-      await setChannelName(env, LAUNDRY_CHANNEL_ID, "🌀", "laundry-alerts");
-      await scheduleTimer(env, "dryer", minutes * 60 * 1000, { msgid: data.id, startTs });
+      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone 🌀 The dryer is RUNNING. It will be done <t:${future}:R>`, devMode);
+      await setChannelName(env, LAUNDRY_CHANNEL_ID, "🌀", "laundry-alerts", devMode);
+      await scheduleTimer(env, "dryer", minutes * 60 * 1000, { msgid: data.id, startTs, devMode });
       return new Response("Started!");
     }
 
@@ -942,10 +875,10 @@ export default {
       const key = personRaw.toLowerCase();
       const ts = Math.floor(Date.now() / 1000);
       await env.KV.put(`status_${key}`, JSON.stringify({ type: "arrived", ts }));
-      await maybePostLocationIntro(env);
-      await sendMessage(env, LOCATION_CHANNEL_ID, `🏠 ${person} has arrived home! (@here)`);
-      await setChannelName(env, LOCATION_CHANNEL_ID, "🏠", "leave-arrival-alerts");
-      await updateStatusBoard(env);
+      await maybePostLocationIntro(env, devMode);
+      await sendMessage(env, LOCATION_CHANNEL_ID, `🏠 ${person} has arrived home! (@here)`, devMode);
+      await setChannelName(env, LOCATION_CHANNEL_ID, "🏠", "leave-arrival-alerts", devMode);
+      await updateStatusBoard(env, devMode);
       return new Response("Done!");
     }
 
@@ -960,10 +893,10 @@ export default {
       const message = destination
         ? `🚶 ${person} has left home and gone to ${destination}. (@here)`
         : `🚶 ${person} has left home. (@here)`;
-      await maybePostLocationIntro(env);
-      await sendMessage(env, LOCATION_CHANNEL_ID, message);
-      await setChannelName(env, LOCATION_CHANNEL_ID, "🚶", "leave-arrival-alerts");
-      await updateStatusBoard(env);
+      await maybePostLocationIntro(env, devMode);
+      await sendMessage(env, LOCATION_CHANNEL_ID, message, devMode);
+      await setChannelName(env, LOCATION_CHANNEL_ID, "🚶", "leave-arrival-alerts", devMode);
+      await updateStatusBoard(env, devMode);
       return new Response("Done!");
     }
 
@@ -981,40 +914,38 @@ export default {
       const ts = Math.floor(Date.now() / 1000);
 
       let mapsLink, placeText;
-
       if (address) {
-        // Address string passed directly (URL-encoded by Shortcut)
         mapsLink = `https://www.google.com/maps?q=${encodeURIComponent(address)}`;
         placeText = ` (${address})`;
       } else {
-        // GPS coords — reverse geocode to get human-readable place name
         mapsLink = `https://www.google.com/maps?q=${lat},${lon}`;
         const place = await reverseGeocode(env, lat, lon);
         placeText = place ? ` (${place})` : "";
       }
 
-      await env.KV.put(`status_${key}`, JSON.stringify({ type: "location", ts, mapsLink, place: placeText.replace(/[()]/g, "").trim() }));
-      await maybePostLocationIntro(env);
-      await sendMessage(env, LOCATION_CHANNEL_ID, `🌐 ${person} is here!${placeText} ${mapsLink} (@here)`);
-      await updateStatusBoard(env);
+      await env.KV.put(`status_${key}`, JSON.stringify({
+        type: "location", ts, mapsLink,
+        place: placeText.replace(/[()]/g, "").trim(),
+      }));
+      await maybePostLocationIntro(env, devMode);
+      await sendMessage(env, LOCATION_CHANNEL_ID, `🌐 ${person} is here!${placeText} ${mapsLink} (@here)`, devMode);
+      await updateStatusBoard(env, devMode);
       return new Response("Done!");
     }
 
-    // --- Default path: /run (dishwasher) ---
-    // Clears any existing empty/done messages, posts running message,
-    // schedules a TimerDO alarm for when the cycle finishes.
+    // --- Default: dishwasher run ---
     const emptyMsgId = await env.KV.get("empty_msg_id");
-    if (emptyMsgId) await deleteMessage(env, CHANNEL_ID, emptyMsgId);
+    if (emptyMsgId) await deleteMessage(env, CHANNEL_ID, emptyMsgId, devMode);
     const doneMsgId = await env.KV.get("done_msg_id");
-    if (doneMsgId) await deleteMessage(env, CHANNEL_ID, doneMsgId);
-    await maybePostIntro(env);
+    if (doneMsgId) await deleteMessage(env, CHANNEL_ID, doneMsgId, devMode);
+    await maybePostIntro(env, devMode);
     const minutes = parseInt(url.searchParams.get("minutes") || "150");
     const startTs = Math.floor(Date.now() / 1000);
     const future = startTs + minutes * 60;
-    const data = await sendMessage(env, CHANNEL_ID, `@everyone 🔴 The dishwasher is RUNNING. It will be done <t:${future}:R>`);
+    const data = await sendMessage(env, CHANNEL_ID, `@everyone 🔴 The dishwasher is RUNNING. It will be done <t:${future}:R>`, devMode);
     await env.KV.put("running_msg_id", data.id);
-    await setChannelName(env, CHANNEL_ID, "🔴", "dishwasher-alerts");
-    await scheduleTimer(env, "dishwasher", minutes * 60 * 1000, { msgid: data.id, startTs });
+    await setChannelName(env, CHANNEL_ID, "🔴", "dishwasher-alerts", devMode);
+    await scheduleTimer(env, "dishwasher", minutes * 60 * 1000, { msgid: data.id, startTs, devMode });
     return new Response("Started!");
   },
 };
