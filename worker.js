@@ -31,11 +31,15 @@ const PEOPLE = {
 // ---------------------------------------------------------------------------
 // Cull config
 // ---------------------------------------------------------------------------
-const CULL_CHANNELS = [CHANNEL_ID, LOCATION_CHANNEL_ID];
+const CULL_CHANNELS = [CHANNEL_ID];
 const CULL_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const LAUNDRY_DONE_TTL_MS = 2 * 60 * 60 * 1000;
 const LAUNDRY_RUN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const CULL_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const LOCATION_DONE_TTL_MS = 2 * 24 * 60 * 60 * 1000;
+const CULL_INTERVAL_MS = 60 * 60 * 1000;
+
+// KV keys whose messages should never be culled regardless of pin status
+const PROTECTED_KV_KEYS = ["status_msg_id", "calendar_msg_id"];
 
 // ---------------------------------------------------------------------------
 // Discord API helpers
@@ -136,9 +140,19 @@ async function getPinnedIds(env, channelId) {
   return Array.isArray(pins) ? pins.map(p => p.id) : [];
 }
 
-async function cullChannel(env, channelId, cutoffMs) {
+// Returns message IDs that should never be deleted, from both pins and KV
+async function getProtectedIds(env, channelId) {
   const pinnedIds = await getPinnedIds(env, channelId);
+  const kvIds = await Promise.all(
+    PROTECTED_KV_KEYS.map(key => env.KV.get(key))
+  );
+  return [...new Set([...pinnedIds, ...kvIds.filter(Boolean)])];
+}
+
+async function cullChannel(env, channelId, cutoffMs) {
+  const protectedIds = await getProtectedIds(env, channelId);
   const cutoff = Date.now() - cutoffMs;
+  console.log(`cullChannel: channel=${channelId} cutoff=${new Date(cutoff).toISOString()} protected=${protectedIds.length}`);
   let lastId = null;
   let culled = 0;
 
@@ -149,20 +163,28 @@ async function cullChannel(env, channelId, cutoffMs) {
 
     const res = await fetch(queryUrl, { headers: botHeaders(env) });
     const messages = await res.json();
+    console.log(`cullChannel: fetched ${Array.isArray(messages) ? messages.length : "error"} messages`);
 
     if (!Array.isArray(messages) || messages.length === 0) break;
 
     for (const msg of messages) {
       const msgTs = Number(BigInt(msg.id) >> 22n) + 1420070400000;
+      const ageHours = Math.round((Date.now() - msgTs) / 3600000);
+      console.log(`msg ${msg.id}: age=${ageHours}h protected=${protectedIds.includes(msg.id)} content="${msg.content?.slice(0, 40)}"`);
+
       if (msgTs > cutoff) {
         lastId = msg.id;
         continue;
       }
-      if (pinnedIds.includes(msg.id)) continue;
-      await fetch(`${API}/channels/${channelId}/messages/${msg.id}`, {
+      if (protectedIds.includes(msg.id)) {
+        console.log(`skipping protected msg ${msg.id}`);
+        continue;
+      }
+      const delRes = await fetch(`${API}/channels/${channelId}/messages/${msg.id}`, {
         method: "DELETE",
         headers: botHeaders(env),
       });
+      console.log(`deleted msg ${msg.id}: status=${delRes.status}`);
       culled++;
       await new Promise(r => setTimeout(r, 500));
     }
@@ -173,6 +195,7 @@ async function cullChannel(env, channelId, cutoffMs) {
     lastId = oldest.id;
   }
 
+  console.log(`cullChannel done: culled=${culled} from ${channelId}`);
   return culled;
 }
 
@@ -485,7 +508,7 @@ async function maybePostDocs(env, devMode) {
       "---",
       "",
       "## 🧹 Auto-Cleanup",
-      "Alert channels are cleaned up every hour. Laundry done messages are deleted after **2 hours**. All other alert messages are deleted after **7 days**. Pinned messages are always preserved. #calendar is never culled.",
+      "Runs every hour. Laundry done messages deleted after **2 hours**. Leave/arrival messages deleted after **2 days**. All other alert messages deleted after **7 days**. Pinned messages and status boards always preserved. #calendar never culled.",
       "",
       "---",
       "",
@@ -612,10 +635,6 @@ async function maybePostCalendarIntro(env, devMode) {
 // Durable Objects
 // ---------------------------------------------------------------------------
 
-// CullDO — runs every hour.
-// On first start: runs immediately, then schedules hourly.
-// Every hour: culls laundry done messages older than 2 hours.
-// At 3 AM EST: full 7-day cull of all alert channels.
 export class CullDO extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -624,9 +643,8 @@ export class CullDO extends DurableObject {
   }
 
   async fetch(request) {
-    // Run immediately on first start
+    console.log("CullDO: starting initial run");
     await this.alarm();
-    // Then schedule next run in 1 hour
     await this.ctx.storage.setAlarm(Date.now() + CULL_INTERVAL_MS);
     return new Response("Culler started and scheduled");
   }
@@ -636,8 +654,8 @@ export class CullDO extends DurableObject {
     const now = new Date();
     const estNow = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
     const hour = estNow.getHours();
+    console.log(`CullDO alarm: hour=${hour} EST`);
 
-    // Always: cull laundry done messages older than 2 hours
     try {
       const culled = await cullChannel(env, LAUNDRY_CHANNEL_ID, LAUNDRY_DONE_TTL_MS);
       console.log(`Hourly laundry cull: removed ${culled} messages`);
@@ -645,7 +663,13 @@ export class CullDO extends DurableObject {
       console.error("Laundry cull failed:", e);
     }
 
-    // At 3 AM EST: full 7-day cull of all channels
+    try {
+      const culled = await cullChannel(env, LOCATION_CHANNEL_ID, LOCATION_DONE_TTL_MS);
+      console.log(`Hourly location cull: removed ${culled} messages`);
+    } catch (e) {
+      console.error("Location cull failed:", e);
+    }
+
     if (hour === 3) {
       console.log("Running full nightly cull at 3 AM EST");
       for (const channelId of CULL_CHANNELS) {
@@ -656,7 +680,6 @@ export class CullDO extends DurableObject {
           console.error(`Nightly cull failed for ${channelId}:`, e);
         }
       }
-      // Also 7-day cull laundry (catches old running/edited messages)
       try {
         await cullChannel(env, LAUNDRY_CHANNEL_ID, LAUNDRY_RUN_TTL_MS);
       } catch (e) {
@@ -664,13 +687,10 @@ export class CullDO extends DurableObject {
       }
     }
 
-    // Reschedule for next hour
     await this.ctx.storage.setAlarm(Date.now() + CULL_INTERVAL_MS);
   }
 }
 
-// TimerDO — general-purpose timed alarm.
-// Each timer is a separate DO instance with its own storage.
 export class TimerDO extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -697,24 +717,20 @@ export class TimerDO extends DurableObject {
       const data = await sendMessage(env, CHANNEL_ID, `@everyone 🏁 The dishwasher is DONE! Ready to unload!`, devMode);
       await env.KV.put("done_msg_id", data.id);
       await setChannelName(env, CHANNEL_ID, "🏁", "dishwasher-alerts", devMode);
-
     } else if (type === "washer") {
       await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🫧 The washer was run at <t:${startTs}:F>.`, devMode);
-      await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ⚠️ The washer is DONE! Move it to the dryer.`, devMode);
+      await sendMessage(env, LAUNDRY_CHANNEL_ID, `⚠️ The washer is DONE! Move it to the dryer.`, devMode);
       await setChannelName(env, LAUNDRY_CHANNEL_ID, "⚠️", "laundry-alerts", devMode);
-
     } else if (type === "dryer") {
       await editMessage(env, LAUNDRY_CHANNEL_ID, msgid, `🌀 The dryer was run at <t:${startTs}:F>.`, devMode);
-      await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone ✅ The dryer is DONE! Ready to fold.`, devMode);
+      await sendMessage(env, LAUNDRY_CHANNEL_ID, `✅ The dryer is DONE! Ready to fold.`, devMode);
       await setChannelName(env, LAUNDRY_CHANNEL_ID, "✅", "laundry-alerts", devMode);
-
     } else if (type === "event_reminder") {
       const events = await getEvents(env);
       const event = events.find(e => e.id === eventId);
       if (event) {
         await sendMessage(env, CALENDAR_CHANNEL_ID, `@everyone 🔔 Reminder: **${eventTitle}** is starting <t:${Math.floor(eventTs / 1000)}:R>!`, devMode);
       }
-
     } else if (type === "event_expire") {
       await pruneExpiredEvents(env);
       await updateCalendarBoard(env, devMode);
@@ -736,11 +752,12 @@ async function scheduleTimer(env, type, delayMs, extras = {}) {
 async function maybeStartCuller(env) {
   const started = await env.KV.get("culler_started");
   if (!started) {
+    console.log("Starting CullDO for first time");
     const id = env.CULLER.newUniqueId();
     const stub = env.CULLER.get(id);
     await stub.fetch("https://internal/start", { method: "POST" });
     await env.KV.put("culler_started", "1");
-    console.log("Culler started — running immediately then every hour");
+    console.log("CullDO started — running immediately then every hour");
   }
 }
 
@@ -757,7 +774,6 @@ export default {
       if (!bodyText) return new Response("Unauthorized", { status: 401 });
 
       const interaction = JSON.parse(bodyText);
-
       if (interaction.type === 1) return Response.json({ type: 1 });
 
       if (interaction.type === 2) {
@@ -818,7 +834,7 @@ export default {
       const minutes = parseInt(url.searchParams.get("minutes") || "45");
       const startTs = Math.floor(Date.now() / 1000);
       const future = startTs + minutes * 60;
-      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone 🫧 The washer is RUNNING. It will be done <t:${future}:R>`, devMode);
+      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `🫧 The washer is RUNNING. It will be done <t:${future}:R>`, devMode);
       await setChannelName(env, LAUNDRY_CHANNEL_ID, "🫧", "laundry-alerts", devMode);
       await scheduleTimer(env, "washer", minutes * 60 * 1000, { msgid: data.id, startTs, devMode });
       return new Response("Started!");
@@ -829,7 +845,7 @@ export default {
       const minutes = parseInt(url.searchParams.get("minutes") || "45");
       const startTs = Math.floor(Date.now() / 1000);
       const future = startTs + minutes * 60;
-      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `@everyone 🌀 The dryer is RUNNING. It will be done <t:${future}:R>`, devMode);
+      const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, `🌀 The dryer is RUNNING. It will be done <t:${future}:R>`, devMode);
       await setChannelName(env, LAUNDRY_CHANNEL_ID, "🌀", "laundry-alerts", devMode);
       await scheduleTimer(env, "dryer", minutes * 60 * 1000, { msgid: data.id, startTs, devMode });
       return new Response("Started!");
