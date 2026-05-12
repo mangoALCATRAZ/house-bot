@@ -31,14 +31,8 @@ const PEOPLE = {
 // ---------------------------------------------------------------------------
 // Cull config
 // ---------------------------------------------------------------------------
-const CULL_CHANNELS = [CHANNEL_ID];
-const CULL_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-const LAUNDRY_DONE_TTL_MS = 2 * 60 * 60 * 1000;
-const LAUNDRY_RUN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const LOCATION_DONE_TTL_MS = 2 * 24 * 60 * 60 * 1000;
-const CULL_INTERVAL_MS = 60 * 60 * 1000;
-
-// KV keys whose messages should never be culled regardless of pin status
+const CULL_CHANNELS = [CHANNEL_ID, LAUNDRY_CHANNEL_ID, LOCATION_CHANNEL_ID];
+const CULL_AGE_MS = 2 * 24 * 60 * 60 * 1000;
 const PROTECTED_KV_KEYS = ["status_msg_id", "calendar_msg_id"];
 
 // ---------------------------------------------------------------------------
@@ -63,6 +57,27 @@ async function sendMessage(env, channelId, content, devMode = false) {
     body: JSON.stringify({ content: finalContent }),
   });
   return res.json();
+}
+
+// Sends an embed message with optional image
+async function sendEmbed(env, channelId, embed, devMode = false) {
+  const targetChannel = devMode ? DEV_CHANNEL_ID : channelId;
+  const res = await fetch(`${API}/channels/${targetChannel}/messages`, {
+    method: "POST",
+    headers: botHeaders(env),
+    body: JSON.stringify({ embeds: [embed] }),
+  });
+  return res.json();
+}
+
+// Edits an embed message
+async function editEmbed(env, channelId, msgId, embed, devMode = false) {
+  if (devMode) return;
+  await fetch(`${API}/channels/${channelId}/messages/${msgId}`, {
+    method: "PATCH",
+    headers: botHeaders(env),
+    body: JSON.stringify({ embeds: [embed] }),
+  });
 }
 
 async function editMessage(env, channelId, msgId, content, devMode = false) {
@@ -132,6 +147,18 @@ async function reverseGeocode(env, lat, lon) {
 // Cull helpers
 // ---------------------------------------------------------------------------
 
+function getNext3AMEST() {
+  const now = new Date();
+  const estNow = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
+  const next3AM = new Date(estNow);
+  next3AM.setHours(3, 0, 0, 0);
+  if (estNow >= next3AM) next3AM.setDate(next3AM.getDate() + 1);
+  const tzOffset =
+    new Date(next3AM.toLocaleString("en-US", { timeZone: "UTC" })) -
+    new Date(next3AM.toLocaleString("en-US", { timeZone: TZ }));
+  return next3AM.getTime() + tzOffset;
+}
+
 async function getPinnedIds(env, channelId) {
   const res = await fetch(`${API}/channels/${channelId}/pins`, {
     headers: botHeaders(env),
@@ -140,13 +167,17 @@ async function getPinnedIds(env, channelId) {
   return Array.isArray(pins) ? pins.map(p => p.id) : [];
 }
 
-// Returns message IDs that should never be deleted, from both pins and KV
 async function getProtectedIds(env, channelId) {
   const pinnedIds = await getPinnedIds(env, channelId);
-  const kvIds = await Promise.all(
-    PROTECTED_KV_KEYS.map(key => env.KV.get(key))
+  const kvIds = await Promise.all(PROTECTED_KV_KEYS.map(key => env.KV.get(key)));
+
+  // Also protect all event embed message IDs
+  const events = await getEvents(env);
+  const eventMsgIds = await Promise.all(
+    events.map(e => env.KV.get(`event_msg_${e.id}`))
   );
-  return [...new Set([...pinnedIds, ...kvIds.filter(Boolean)])];
+
+  return [...new Set([...pinnedIds, ...kvIds.filter(Boolean), ...eventMsgIds.filter(Boolean)])];
 }
 
 async function cullChannel(env, channelId, cutoffMs) {
@@ -170,7 +201,7 @@ async function cullChannel(env, channelId, cutoffMs) {
     for (const msg of messages) {
       const msgTs = Number(BigInt(msg.id) >> 22n) + 1420070400000;
       const ageHours = Math.round((Date.now() - msgTs) / 3600000);
-      console.log(`msg ${msg.id}: age=${ageHours}h protected=${protectedIds.includes(msg.id)} content="${msg.content?.slice(0, 40)}"`);
+      console.log(`msg ${msg.id}: age=${ageHours}h protected=${protectedIds.includes(msg.id)}`);
 
       if (msgTs > cutoff) {
         lastId = msg.id;
@@ -262,6 +293,7 @@ async function pruneExpiredEvents(env) {
   return upcoming;
 }
 
+// Builds the text index board listing all upcoming events
 async function buildCalendarBoard(env) {
   const events = await pruneExpiredEvents(env);
   const lines = ["📅 **Upcoming Events**", "​"];
@@ -283,6 +315,24 @@ async function buildCalendarBoard(env) {
   return lines.join("\n");
 }
 
+// Builds a Discord embed object for a single event
+function buildEventEmbed(event) {
+  const ts = Math.floor(event.ts / 1000);
+  const embed = {
+    title: `📌 ${event.title}`,
+    color: 0x5865F2, // Discord blurple
+    fields: [
+      { name: "When", value: `<t:${ts}:F> (<t:${ts}:R>)`, inline: false },
+      { name: "Reminder", value: `${event.reminder} min before`, inline: true },
+      { name: "ID", value: `\`${event.id}\``, inline: true },
+    ],
+  };
+  if (event.image) {
+    embed.image = { url: event.image };
+  }
+  return embed;
+}
+
 async function updateCalendarBoard(env, devMode = false) {
   const calMsgId = await env.KV.get("calendar_msg_id");
   const content = await buildCalendarBoard(env);
@@ -298,6 +348,7 @@ async function handleEventCommand(env, options, devMode) {
   const date = options.find(o => o.name === "date")?.value;
   const time = options.find(o => o.name === "time")?.value;
   const reminder = options.find(o => o.name === "reminder")?.value ?? 30;
+  const image = options.find(o => o.name === "image")?.value ?? null;
 
   if (!title || !date || !time) return "❌ Missing title, date, or time.";
 
@@ -315,19 +366,32 @@ async function handleEventCommand(env, options, devMode) {
   await maybePostCalendarIntro(env, devMode);
 
   const id = `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  const event = { id, title, ts: eventTs, reminder, image };
   const events = await getEvents(env);
-  events.push({ id, title, ts: eventTs, reminder });
+  events.push(event);
   await saveEvents(env, events);
 
+  // Post pinned embed for this event
+  const embed = buildEventEmbed(event);
+  const embedMsg = await sendEmbed(env, CALENDAR_CHANNEL_ID, embed, devMode);
+  if (embedMsg.id) {
+    await pinMessage(env, CALENDAR_CHANNEL_ID, embedMsg.id, devMode);
+    await env.KV.put(`event_msg_${id}`, embedMsg.id);
+  }
+
+  // Schedule reminder and expiry timers
   const reminderDelay = eventTs - now - reminder * 60 * 1000;
   if (reminderDelay > 0) {
     await scheduleTimer(env, "event_reminder", reminderDelay, {
       eventId: id, eventTitle: title, eventTs, devMode,
     });
   }
-
   await scheduleTimer(env, "event_expire", eventTs - now + 60000, { eventId: id, devMode });
+
+  // Update the text index board
   await updateCalendarBoard(env, devMode);
+
+  // Post announcement (no image here)
   await sendMessage(env, CALENDAR_CHANNEL_ID, `@here 📅 New event added: **${title}** — <t:${Math.floor(eventTs / 1000)}:F> 🔔 Reminder ${reminder} min before. 🆔 \`${id}\``, devMode);
 
   return `✅ Event **${title}** added for <t:${Math.floor(eventTs / 1000)}:F>! ID: \`${id}\``;
@@ -343,6 +407,14 @@ async function handleCancelCommand(env, options, devMode) {
 
   const [removed] = events.splice(idx, 1);
   await saveEvents(env, events);
+
+  // Delete the event's pinned embed message
+  const embedMsgId = await env.KV.get(`event_msg_${id}`);
+  if (embedMsgId) {
+    await deleteMessage(env, CALENDAR_CHANNEL_ID, embedMsgId, devMode);
+    await env.KV.delete(`event_msg_${id}`);
+  }
+
   await updateCalendarBoard(env, devMode);
   await sendMessage(env, CALENDAR_CHANNEL_ID, `@here ❌ Event cancelled: **${removed.title}** (<t:${Math.floor(removed.ts / 1000)}:F>)`, devMode);
 
@@ -472,7 +544,7 @@ async function maybePostDocs(env, devMode) {
       "## 📅 Calendar",
       "Managed via slash commands in #calendar. All times in EST.",
       "",
-      "`/event title date time [reminder]` — Add an event",
+      "`/event title date time [reminder] [image]` — Add an event",
       "`/cancel id` — Cancel an event by ID",
       "`/events` — List all upcoming events",
       "",
@@ -508,7 +580,7 @@ async function maybePostDocs(env, devMode) {
       "---",
       "",
       "## 🧹 Auto-Cleanup",
-      "Runs every hour. Laundry done messages deleted after **2 hours**. Leave/arrival messages deleted after **2 days**. All other alert messages deleted after **7 days**. Pinned messages and status boards always preserved. #calendar never culled.",
+      "All alert channels culled once daily at **3 AM EST**. Messages older than **2 days** are deleted. Pinned messages and status boards always preserved. #calendar never culled.",
       "",
       "---",
       "",
@@ -609,11 +681,11 @@ async function maybePostCalendarIntro(env, devMode) {
         "👋 **Welcome to #calendar!**",
         "This is the shared house calendar. Use slash commands to manage events:",
         "​",
-        "📌 `/event title:Dentist date:2026-05-01 time:14:00 reminder:30` — Add an event",
+        "📌 `/event title:Dentist date:2026-05-01 time:14:00 reminder:30 image:https://...` — Add an event",
         "❌ `/cancel id:evt_abc123` — Cancel an event by ID",
         "📋 `/events` — List all upcoming events",
         "​",
-        "All times are in EST. Event IDs are shown in the calendar below.",
+        "All times are in EST. Each event gets its own pinned card below. Image is optional.",
         "​",
         "​",
       ].join("\n"), devMode);
@@ -645,49 +717,24 @@ export class CullDO extends DurableObject {
   async fetch(request) {
     console.log("CullDO: starting initial run");
     await this.alarm();
-    await this.ctx.storage.setAlarm(Date.now() + CULL_INTERVAL_MS);
-    return new Response("Culler started and scheduled");
+    await this.ctx.storage.setAlarm(getNext3AMEST());
+    return new Response("Culler started and scheduled for 3 AM EST");
   }
 
   async alarm() {
     const env = this.env;
-    const now = new Date();
-    const estNow = new Date(now.toLocaleString("en-US", { timeZone: TZ }));
-    const hour = estNow.getHours();
-    console.log(`CullDO alarm: hour=${hour} EST`);
+    console.log("CullDO: running daily 3 AM cull");
 
-    try {
-      const culled = await cullChannel(env, LAUNDRY_CHANNEL_ID, LAUNDRY_DONE_TTL_MS);
-      console.log(`Hourly laundry cull: removed ${culled} messages`);
-    } catch (e) {
-      console.error("Laundry cull failed:", e);
-    }
-
-    try {
-      const culled = await cullChannel(env, LOCATION_CHANNEL_ID, LOCATION_DONE_TTL_MS);
-      console.log(`Hourly location cull: removed ${culled} messages`);
-    } catch (e) {
-      console.error("Location cull failed:", e);
-    }
-
-    if (hour === 3) {
-      console.log("Running full nightly cull at 3 AM EST");
-      for (const channelId of CULL_CHANNELS) {
-        try {
-          const culled = await cullChannel(env, channelId, CULL_AGE_MS);
-          console.log(`Nightly cull: removed ${culled} from ${channelId}`);
-        } catch (e) {
-          console.error(`Nightly cull failed for ${channelId}:`, e);
-        }
-      }
+    for (const channelId of CULL_CHANNELS) {
       try {
-        await cullChannel(env, LAUNDRY_CHANNEL_ID, LAUNDRY_RUN_TTL_MS);
+        const culled = await cullChannel(env, channelId, CULL_AGE_MS);
+        console.log(`Culled ${culled} messages from ${channelId}`);
       } catch (e) {
-        console.error("Nightly laundry cull failed:", e);
+        console.error(`Cull failed for ${channelId}:`, e);
       }
     }
 
-    await this.ctx.storage.setAlarm(Date.now() + CULL_INTERVAL_MS);
+    await this.ctx.storage.setAlarm(getNext3AMEST());
   }
 }
 
@@ -732,6 +779,12 @@ export class TimerDO extends DurableObject {
         await sendMessage(env, CALENDAR_CHANNEL_ID, `@everyone 🔔 Reminder: **${eventTitle}** is starting <t:${Math.floor(eventTs / 1000)}:R>!`, devMode);
       }
     } else if (type === "event_expire") {
+      // Clean up the event's embed message when it expires
+      const embedMsgId = await env.KV.get(`event_msg_${eventId}`);
+      if (embedMsgId) {
+        await deleteMessage(env, CALENDAR_CHANNEL_ID, embedMsgId, devMode);
+        await env.KV.delete(`event_msg_${eventId}`);
+      }
       await pruneExpiredEvents(env);
       await updateCalendarBoard(env, devMode);
     }
@@ -757,7 +810,7 @@ async function maybeStartCuller(env) {
     const stub = env.CULLER.get(id);
     await stub.fetch("https://internal/start", { method: "POST" });
     await env.KV.put("culler_started", "1");
-    console.log("CullDO started — running immediately then every hour");
+    console.log("CullDO started — running now then daily at 3 AM EST");
   }
 }
 
