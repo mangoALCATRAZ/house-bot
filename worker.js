@@ -31,7 +31,7 @@ const PEOPLE = {
 // ---------------------------------------------------------------------------
 // Cull config
 // ---------------------------------------------------------------------------
-const CULL_CHANNELS = [CHANNEL_ID, LAUNDRY_CHANNEL_ID, LOCATION_CHANNEL_ID];
+const CULL_CHANNELS = [CHANNEL_ID, LAUNDRY_CHANNEL_ID, LOCATION_CHANNEL_ID, CALENDAR_CHANNEL_ID];
 const CULL_AGE_MS = 2 * 24 * 60 * 60 * 1000;
 const PROTECTED_KV_KEYS = ["status_msg_id", "calendar_msg_id"];
 
@@ -59,24 +59,25 @@ async function sendMessage(env, channelId, content, devMode = false) {
   return res.json();
 }
 
-// Sends an embed message with optional image
-async function sendEmbed(env, channelId, embed, devMode = false) {
+async function sendEmbeds(env, channelId, content, embeds, devMode = false) {
   const targetChannel = devMode ? DEV_CHANNEL_ID : channelId;
+  const finalContent = devMode
+    ? `[→ <#${channelId}>] ${(content || "").replace(/@everyone/g, "").replace(/@here/g, "").trim()}`
+    : (content || "");
   const res = await fetch(`${API}/channels/${targetChannel}/messages`, {
     method: "POST",
     headers: botHeaders(env),
-    body: JSON.stringify({ embeds: [embed] }),
+    body: JSON.stringify({ content: finalContent, embeds }),
   });
   return res.json();
 }
 
-// Edits an embed message
-async function editEmbed(env, channelId, msgId, embed, devMode = false) {
+async function editEmbeds(env, channelId, msgId, content, embeds, devMode = false) {
   if (devMode) return;
   await fetch(`${API}/channels/${channelId}/messages/${msgId}`, {
     method: "PATCH",
     headers: botHeaders(env),
-    body: JSON.stringify({ embeds: [embed] }),
+    body: JSON.stringify({ content: content || "", embeds }),
   });
 }
 
@@ -170,14 +171,7 @@ async function getPinnedIds(env, channelId) {
 async function getProtectedIds(env, channelId) {
   const pinnedIds = await getPinnedIds(env, channelId);
   const kvIds = await Promise.all(PROTECTED_KV_KEYS.map(key => env.KV.get(key)));
-
-  // Also protect all event embed message IDs
-  const events = await getEvents(env);
-  const eventMsgIds = await Promise.all(
-    events.map(e => env.KV.get(`event_msg_${e.id}`))
-  );
-
-  return [...new Set([...pinnedIds, ...kvIds.filter(Boolean), ...eventMsgIds.filter(Boolean)])];
+  return [...new Set([...pinnedIds, ...kvIds.filter(Boolean)])];
 }
 
 async function cullChannel(env, channelId, cutoffMs) {
@@ -194,23 +188,13 @@ async function cullChannel(env, channelId, cutoffMs) {
 
     const res = await fetch(queryUrl, { headers: botHeaders(env) });
     const messages = await res.json();
-    console.log(`cullChannel: fetched ${Array.isArray(messages) ? messages.length : "error"} messages`);
 
     if (!Array.isArray(messages) || messages.length === 0) break;
 
     for (const msg of messages) {
       const msgTs = Number(BigInt(msg.id) >> 22n) + 1420070400000;
-      const ageHours = Math.round((Date.now() - msgTs) / 3600000);
-      console.log(`msg ${msg.id}: age=${ageHours}h protected=${protectedIds.includes(msg.id)}`);
-
-      if (msgTs > cutoff) {
-        lastId = msg.id;
-        continue;
-      }
-      if (protectedIds.includes(msg.id)) {
-        console.log(`skipping protected msg ${msg.id}`);
-        continue;
-      }
+      if (msgTs > cutoff) { lastId = msg.id; continue; }
+      if (protectedIds.includes(msg.id)) continue;
       const delRes = await fetch(`${API}/channels/${channelId}/messages/${msg.id}`, {
         method: "DELETE",
         headers: botHeaders(env),
@@ -276,6 +260,27 @@ function parseEventTime(date, time) {
   return new Date(naive.getTime() + tzOffset);
 }
 
+// Converts reminder value + unit to minutes
+function toMinutes(value, unit) {
+  switch (unit) {
+    case "hours": return value * 60;
+    case "days": return value * 60 * 24;
+    case "weeks": return value * 60 * 24 * 7;
+    default: return value; // minutes
+  }
+}
+
+// Human-readable reminder label e.g. "1 day", "2 hours", "30 minutes"
+function reminderLabel(value, unit) {
+  const singular = value === 1;
+  switch (unit) {
+    case "hours": return `${value} ${singular ? "hour" : "hours"}`;
+    case "days": return `${value} ${singular ? "day" : "days"}`;
+    case "weeks": return `${value} ${singular ? "week" : "weeks"}`;
+    default: return `${value} ${singular ? "minute" : "minutes"}`;
+  }
+}
+
 async function getEvents(env) {
   const raw = await env.KV.get("calendar_events");
   return raw ? JSON.parse(raw) : [];
@@ -293,50 +298,43 @@ async function pruneExpiredEvents(env) {
   return upcoming;
 }
 
-// Builds the text index board listing all upcoming events
-async function buildCalendarBoard(env) {
-  const events = await pruneExpiredEvents(env);
-  const lines = ["📅 **Upcoming Events**", "​"];
-
-  if (events.length === 0) {
-    lines.push("No upcoming events.");
-  } else {
-    const sorted = [...events].sort((a, b) => a.ts - b.ts);
-    for (const e of sorted) {
-      const ts = Math.floor(e.ts / 1000);
-      lines.push(`📌 **${e.title}** — <t:${ts}:F> (<t:${ts}:R>)`);
-      lines.push(`   🔔 Reminder: ${e.reminder} min before  |  🆔 \`${e.id}\``);
-      lines.push("");
-    }
-  }
-
-  lines.push("​");
-  lines.push("​");
-  return lines.join("\n");
-}
-
-// Builds a Discord embed object for a single event
+// Builds one Discord embed per event for the Upcoming Events board
 function buildEventEmbed(event) {
   const ts = Math.floor(event.ts / 1000);
   const embed = {
     title: `📌 ${event.title}`,
-    color: 0x5865F2, // Discord blurple
+    color: 0x5865F2,
     fields: [
       { name: "When", value: `<t:${ts}:F> (<t:${ts}:R>)`, inline: false },
-      { name: "Reminder", value: `${event.reminder} min before`, inline: true },
+      { name: "Reminder", value: event.reminderLabel || `${event.reminder} minutes`, inline: true },
       { name: "ID", value: `\`${event.id}\``, inline: true },
     ],
   };
+  if (event.locationName && event.locationUrl) {
+    embed.fields.push({ name: "Location", value: `[${event.locationName}](${event.locationUrl})`, inline: false });
+  } else if (event.locationName) {
+    embed.fields.push({ name: "Location", value: event.locationName, inline: false });
+  }
   if (event.image) {
     embed.image = { url: event.image };
   }
   return embed;
 }
 
+// Edits the pinned Upcoming Events board with one embed per event (max 10)
 async function updateCalendarBoard(env, devMode = false) {
   const calMsgId = await env.KV.get("calendar_msg_id");
-  const content = await buildCalendarBoard(env);
-  if (calMsgId) await editMessage(env, CALENDAR_CHANNEL_ID, calMsgId, content, devMode);
+  if (!calMsgId) return;
+
+  const events = await pruneExpiredEvents(env);
+  const sorted = [...events].sort((a, b) => a.ts - b.ts);
+
+  if (sorted.length === 0) {
+    await editEmbeds(env, CALENDAR_CHANNEL_ID, calMsgId, "📅 **Upcoming Events**\n\nNo upcoming events.", [], devMode);
+  } else {
+    const embeds = sorted.slice(0, 10).map(buildEventEmbed);
+    await editEmbeds(env, CALENDAR_CHANNEL_ID, calMsgId, "📅 **Upcoming Events**", embeds, devMode);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -347,8 +345,11 @@ async function handleEventCommand(env, options, devMode) {
   const title = options.find(o => o.name === "title")?.value;
   const date = options.find(o => o.name === "date")?.value;
   const time = options.find(o => o.name === "time")?.value;
-  const reminder = options.find(o => o.name === "reminder")?.value ?? 30;
+  const reminderValue = options.find(o => o.name === "reminder")?.value ?? 30;
+  const reminderUnit = options.find(o => o.name === "reminder_unit")?.value ?? "minutes";
   const image = options.find(o => o.name === "image")?.value ?? null;
+  const locationName = options.find(o => o.name === "location_name")?.value ?? null;
+  const locationUrl = options.find(o => o.name === "location_url")?.value ?? null;
 
   if (!title || !date || !time) return "❌ Missing title, date, or time.";
 
@@ -365,22 +366,19 @@ async function handleEventCommand(env, options, devMode) {
 
   await maybePostCalendarIntro(env, devMode);
 
+  // Convert reminder to minutes for scheduling, store label for display
+  const reminderMinutes = toMinutes(reminderValue, reminderUnit);
+  const label = reminderLabel(reminderValue, reminderUnit);
+
   const id = `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-  const event = { id, title, ts: eventTs, reminder, image };
+  const event = { id, title, ts: eventTs, reminder: reminderMinutes, reminderLabel: label, image, locationName, locationUrl };
   const events = await getEvents(env);
   events.push(event);
   await saveEvents(env, events);
 
-  // Post pinned embed for this event
-  const embed = buildEventEmbed(event);
-  const embedMsg = await sendEmbed(env, CALENDAR_CHANNEL_ID, embed, devMode);
-  if (embedMsg.id) {
-    await pinMessage(env, CALENDAR_CHANNEL_ID, embedMsg.id, devMode);
-    await env.KV.put(`event_msg_${id}`, embedMsg.id);
-  }
+  await updateCalendarBoard(env, devMode);
 
-  // Schedule reminder and expiry timers
-  const reminderDelay = eventTs - now - reminder * 60 * 1000;
+  const reminderDelay = eventTs - now - reminderMinutes * 60 * 1000;
   if (reminderDelay > 0) {
     await scheduleTimer(env, "event_reminder", reminderDelay, {
       eventId: id, eventTitle: title, eventTs, devMode,
@@ -388,13 +386,12 @@ async function handleEventCommand(env, options, devMode) {
   }
   await scheduleTimer(env, "event_expire", eventTs - now + 60000, { eventId: id, devMode });
 
-  // Update the text index board
-  await updateCalendarBoard(env, devMode);
+  await sendMessage(env, CALENDAR_CHANNEL_ID,
+    `@here 📅 New event added: **${title}** — <t:${Math.floor(eventTs / 1000)}:F> 🔔 Reminder ${label} before. 🆔 \`${id}\``,
+    devMode
+  );
 
-  // Post announcement (no image here)
-  await sendMessage(env, CALENDAR_CHANNEL_ID, `@here 📅 New event added: **${title}** — <t:${Math.floor(eventTs / 1000)}:F> 🔔 Reminder ${reminder} min before. 🆔 \`${id}\``, devMode);
-
-  return `✅ Event **${title}** added for <t:${Math.floor(eventTs / 1000)}:F>! ID: \`${id}\``;
+  return `✅ Event **${title}** added for <t:${Math.floor(eventTs / 1000)}:F>! Reminder: ${label} before. ID: \`${id}\``;
 }
 
 async function handleCancelCommand(env, options, devMode) {
@@ -407,16 +404,12 @@ async function handleCancelCommand(env, options, devMode) {
 
   const [removed] = events.splice(idx, 1);
   await saveEvents(env, events);
-
-  // Delete the event's pinned embed message
-  const embedMsgId = await env.KV.get(`event_msg_${id}`);
-  if (embedMsgId) {
-    await deleteMessage(env, CALENDAR_CHANNEL_ID, embedMsgId, devMode);
-    await env.KV.delete(`event_msg_${id}`);
-  }
-
   await updateCalendarBoard(env, devMode);
-  await sendMessage(env, CALENDAR_CHANNEL_ID, `@here ❌ Event cancelled: **${removed.title}** (<t:${Math.floor(removed.ts / 1000)}:F>)`, devMode);
+
+  await sendMessage(env, CALENDAR_CHANNEL_ID,
+    `@here ❌ Event cancelled: **${removed.title}** (<t:${Math.floor(removed.ts / 1000)}:F>)`,
+    devMode
+  );
 
   return `✅ Event **${removed.title}** cancelled.`;
 }
@@ -429,7 +422,9 @@ async function handleEventsCommand(env) {
   const lines = ["📅 **Upcoming Events**", ""];
   for (const e of sorted) {
     const ts = Math.floor(e.ts / 1000);
-    lines.push(`📌 **${e.title}** — <t:${ts}:F> (<t:${ts}:R>) 🆔 \`${e.id}\``);
+    let line = `📌 **${e.title}** — <t:${ts}:F> (<t:${ts}:R>) 🆔 \`${e.id}\``;
+    if (e.locationName) line += ` 📍 ${e.locationName}`;
+    lines.push(line);
   }
   return lines.join("\n");
 }
@@ -476,9 +471,7 @@ async function updateStatusBoard(env, devMode = false) {
 async function maybePostGeneral(env, devMode) {
   const posted = await env.KV.get("general_intro_posted");
   if (posted) return;
-  const res = await fetch(`${API}/channels/${GENERAL_CHANNEL_ID}/messages?limit=1`, {
-    headers: botHeaders(env),
-  });
+  const res = await fetch(`${API}/channels/${GENERAL_CHANNEL_ID}/messages?limit=1`, { headers: botHeaders(env) });
   const messages = await res.json();
   if (messages.length === 0) {
     const data = await sendMessage(env, GENERAL_CHANNEL_ID, [
@@ -501,9 +494,7 @@ async function maybePostGeneral(env, devMode) {
 async function maybePostDocs(env, devMode) {
   const posted = await env.KV.get("docs_intro_posted");
   if (posted) return;
-  const res = await fetch(`${API}/channels/${DOCS_CHANNEL_ID}/messages?limit=1`, {
-    headers: botHeaders(env),
-  });
+  const res = await fetch(`${API}/channels/${DOCS_CHANNEL_ID}/messages?limit=1`, { headers: botHeaders(env) });
   const messages = await res.json();
   if (messages.length === 0) {
     const data = await sendMessage(env, DOCS_CHANNEL_ID, [
@@ -544,7 +535,8 @@ async function maybePostDocs(env, devMode) {
       "## 📅 Calendar",
       "Managed via slash commands in #calendar. All times in EST.",
       "",
-      "`/event title date time [reminder] [image]` — Add an event",
+      "`/event title date time [reminder] [reminder_unit] [image] [location_name] [location_url]` — Add an event",
+      "- `reminder_unit`: minutes (default), hours, days, weeks",
       "`/cancel id` — Cancel an event by ID",
       "`/events` — List all upcoming events",
       "",
@@ -566,7 +558,6 @@ async function maybePostDocs(env, devMode) {
       "- `person` — e.g. `snake` *(required)*",
       "- `lat` + `lon` — GPS coordinates *(optional)*",
       "- `address` — URL-encoded address string *(optional)*",
-      "- Either `lat`/`lon` or `address` is required",
       "Example (GPS): `/location?token=TOKEN&person=snake&lat=39.9526&lon=-75.1652`",
       "Example (address): `/location?token=TOKEN&person=snake&address=1600%20Pennsylvania%20Ave`",
       "",
@@ -580,7 +571,7 @@ async function maybePostDocs(env, devMode) {
       "---",
       "",
       "## 🧹 Auto-Cleanup",
-      "All alert channels culled once daily at **3 AM EST**. Messages older than **2 days** are deleted. Pinned messages and status boards always preserved. #calendar never culled.",
+      "All channels culled once daily at **3 AM EST**. Messages older than **2 days** are deleted. Pinned messages and status boards always preserved.",
       "",
       "---",
       "",
@@ -594,9 +585,7 @@ async function maybePostDocs(env, devMode) {
 async function maybePostIntro(env, devMode) {
   const posted = await env.KV.get("dishwasher_intro_posted");
   if (posted) return;
-  const res = await fetch(`${API}/channels/${CHANNEL_ID}/messages?limit=1`, {
-    headers: botHeaders(env),
-  });
+  const res = await fetch(`${API}/channels/${CHANNEL_ID}/messages?limit=1`, { headers: botHeaders(env) });
   const messages = await res.json();
   if (messages.length === 0) {
     const data = await sendMessage(env, CHANNEL_ID, [
@@ -618,9 +607,7 @@ async function maybePostIntro(env, devMode) {
 async function maybePostLocationIntro(env, devMode) {
   const posted = await env.KV.get("location_intro_posted");
   if (posted) return;
-  const res = await fetch(`${API}/channels/${LOCATION_CHANNEL_ID}/messages?limit=1`, {
-    headers: botHeaders(env),
-  });
+  const res = await fetch(`${API}/channels/${LOCATION_CHANNEL_ID}/messages?limit=1`, { headers: botHeaders(env) });
   const messages = await res.json();
   if (messages.length === 0) {
     const intro = await sendMessage(env, LOCATION_CHANNEL_ID, [
@@ -647,9 +634,7 @@ async function maybePostLocationIntro(env, devMode) {
 async function maybePostLaundryIntro(env, devMode) {
   const posted = await env.KV.get("laundry_intro_posted");
   if (posted) return;
-  const res = await fetch(`${API}/channels/${LAUNDRY_CHANNEL_ID}/messages?limit=1`, {
-    headers: botHeaders(env),
-  });
+  const res = await fetch(`${API}/channels/${LAUNDRY_CHANNEL_ID}/messages?limit=1`, { headers: botHeaders(env) });
   const messages = await res.json();
   if (messages.length === 0) {
     const data = await sendMessage(env, LAUNDRY_CHANNEL_ID, [
@@ -672,20 +657,18 @@ async function maybePostLaundryIntro(env, devMode) {
 async function maybePostCalendarIntro(env, devMode) {
   const posted = await env.KV.get("calendar_intro_posted");
   if (!posted) {
-    const res = await fetch(`${API}/channels/${CALENDAR_CHANNEL_ID}/messages?limit=1`, {
-      headers: botHeaders(env),
-    });
+    const res = await fetch(`${API}/channels/${CALENDAR_CHANNEL_ID}/messages?limit=1`, { headers: botHeaders(env) });
     const messages = await res.json();
     if (messages.length === 0) {
       const intro = await sendMessage(env, CALENDAR_CHANNEL_ID, [
         "👋 **Welcome to #calendar!**",
         "This is the shared house calendar. Use slash commands to manage events:",
         "​",
-        "📌 `/event title:Dentist date:2026-05-01 time:14:00 reminder:30 image:https://...` — Add an event",
+        "📌 `/event title:Dentist date:2026-05-01 time:14:00 reminder:1 reminder_unit:days` — Add an event",
         "❌ `/cancel id:evt_abc123` — Cancel an event by ID",
         "📋 `/events` — List all upcoming events",
         "​",
-        "All times are in EST. Each event gets its own pinned card below. Image is optional.",
+        "All times are in EST. Reminder units: minutes (default), hours, days, weeks. Location and image are optional.",
         "​",
         "​",
       ].join("\n"), devMode);
@@ -696,10 +679,11 @@ async function maybePostCalendarIntro(env, devMode) {
 
   const calMsgId = await env.KV.get("calendar_msg_id");
   if (!calMsgId) {
-    const calContent = await buildCalendarBoard(env);
-    const calMsg = await sendMessage(env, CALENDAR_CHANNEL_ID, calContent, devMode);
-    await pinMessage(env, CALENDAR_CHANNEL_ID, calMsg.id, devMode);
-    await env.KV.put("calendar_msg_id", calMsg.id);
+    const boardMsg = await sendEmbeds(env, CALENDAR_CHANNEL_ID, "📅 **Upcoming Events**", [], devMode);
+    if (boardMsg.id) {
+      await pinMessage(env, CALENDAR_CHANNEL_ID, boardMsg.id, devMode);
+      await env.KV.put("calendar_msg_id", boardMsg.id);
+    }
   }
 }
 
@@ -724,7 +708,6 @@ export class CullDO extends DurableObject {
   async alarm() {
     const env = this.env;
     console.log("CullDO: running daily 3 AM cull");
-
     for (const channelId of CULL_CHANNELS) {
       try {
         const culled = await cullChannel(env, channelId, CULL_AGE_MS);
@@ -733,7 +716,6 @@ export class CullDO extends DurableObject {
         console.error(`Cull failed for ${channelId}:`, e);
       }
     }
-
     await this.ctx.storage.setAlarm(getNext3AMEST());
   }
 }
@@ -779,12 +761,6 @@ export class TimerDO extends DurableObject {
         await sendMessage(env, CALENDAR_CHANNEL_ID, `@everyone 🔔 Reminder: **${eventTitle}** is starting <t:${Math.floor(eventTs / 1000)}:R>!`, devMode);
       }
     } else if (type === "event_expire") {
-      // Clean up the event's embed message when it expires
-      const embedMsgId = await env.KV.get(`event_msg_${eventId}`);
-      if (embedMsgId) {
-        await deleteMessage(env, CALENDAR_CHANNEL_ID, embedMsgId, devMode);
-        await env.KV.delete(`event_msg_${eventId}`);
-      }
       await pruneExpiredEvents(env);
       await updateCalendarBoard(env, devMode);
     }
