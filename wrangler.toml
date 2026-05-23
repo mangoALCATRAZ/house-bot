@@ -10,14 +10,30 @@ id = "1bcf1ec125d44c1a88f45f0a89595374"
 name = "TIMER"
 class_name = "TimerDO"
 
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["TimerDO"]
-
 [[durable_objects.bindings]]
 name = "CULLER"
 class_name = "CullDO"
 
+[[durable_objects.bindings]]
+name = "TRADE_POLLER"
+class_name = "TradePollDO"
+
+[[durable_objects.bindings]]
+name = "SUMMARY_DO"
+class_name = "SummaryDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TimerDO"]
+
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["CullDO"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["TradePollDO"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["SummaryDO"]
